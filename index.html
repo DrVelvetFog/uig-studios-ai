@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Sets data-theme BEFORE CSS parses — prevents flash of wrong theme -->
+    <script>
+      (function(){
+        var t = localStorage.getItem('tonyai-theme');
+        // v2 reset: if theme version not set, migrate to dark
+        if (localStorage.getItem('tonyai-theme-v') !== '2') {
+          t = 'dark';
+          localStorage.setItem('tonyai-theme', 'dark');
+          localStorage.setItem('tonyai-theme-v', '2');
+        }
+        document.documentElement.setAttribute('data-theme', t === 'light' ? 'light' : 'dark');
+      })();
+    </script>
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TonyAI</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Syne:wght@700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

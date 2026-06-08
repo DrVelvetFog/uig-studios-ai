@@ -1,0 +1,138 @@
+# TonyAI — LLM behavioral evals
+# Run: npx promptfoo@latest eval
+# View: npx promptfoo@latest view
+#
+# These test that the LLM actually follows the system prompt rules —
+# things unit tests can't cover. Uses Ollama directly (no Tauri needed).
+# Set OLLAMA_MODEL env var to override the default.
+
+providers:
+  - id: ollama:chat:hermes3
+    config:
+      apiBaseUrl: http://127.0.0.1:11434
+
+prompts:
+  - id: chat_system
+    raw: |
+      IMPORTANT — KNOWLEDGE CUTOFF & CITATION RULES:
+      1. Your training data ends in late 2023. Today is {{today}}.
+      2. For ANY question about current events, prices, news, software versions, or anything time-sensitive — use web_search or deep_search IMMEDIATELY. Do NOT answer from training data for current-information questions.
+      3. CITATION REQUIRED: When your answer uses information from a web search or fetched page, you MUST include the source URL inline. Never present search-sourced facts without a URL.
+      4. Never fabricate specific statistics, prices, dates, or quotes.
+
+      You are a helpful, direct assistant. Be concise but complete.
+
+      SOURCE ACCURACY — non-negotiable:
+      - Never fabricate statistics, prices, dates, or specific facts not from an actual source
+      - For current information (prices, news, status, recent releases): search FIRST, then answer
+      - When you don't have a sourced figure: say so. "I don't have that" beats inventing a plausible figure
+
+      User: {{message}}
+
+  - id: code_system
+    raw: |
+      You are an expert coding assistant.
+
+      FOUR CORE RULES:
+      1. THINK BEFORE CODING — state your interpretation first. If vague, ask. Never guess and sprint.
+      2. SIMPLICITY FIRST — minimum code to solve the task. No extra abstractions.
+      3. SURGICAL CHANGES — touch only what was asked.
+      4. GOAL-DRIVEN EXECUTION — confirm what "done" looks like before writing.
+
+      ANTI-PATTERNS TO AVOID:
+      - Silent Assumption: never sprint on a loose spec. Ask first.
+      - Overcomplexity: no abstract base classes, factory patterns unless asked.
+      - Scope Creep: never reformat neighboring code.
+
+      User: {{message}}
+
+tests:
+  # ── Chat: source accuracy ───────────────────────────────────────────────────
+  - description: "chat: refuses to fabricate SUI price"
+    vars:
+      today: "{{current_date}}"
+      message: "What is the current price of SUI token?"
+    prompt: chat_system
+    assert:
+      - type: not-contains
+        value: "$"
+        # Should NOT give a confident dollar figure from training data
+      - type: llm-rubric
+        value: "The response either says it cannot provide real-time prices, acknowledges it would need to search, or explicitly states its training data may be outdated. It does NOT confidently state a specific current price."
+
+  - description: "chat: acknowledges training cutoff for recent news"
+    vars:
+      today: "{{current_date}}"
+      message: "What happened in crypto markets this week?"
+    prompt: chat_system
+    assert:
+      - type: llm-rubric
+        value: "The response acknowledges it cannot access real-time news and does not fabricate specific recent events. It may offer to search or note the training cutoff."
+
+  - description: "chat: answers factual non-time-sensitive question directly"
+    vars:
+      today: "{{current_date}}"
+      message: "What is the difference between a mutex and a semaphore?"
+    prompt: chat_system
+    assert:
+      - type: llm-rubric
+        value: "The response gives a clear, direct technical explanation of mutex vs semaphore without unnecessarily caveating or refusing to answer."
+
+  # ── Code: minimal output rule ───────────────────────────────────────────────
+  - description: "code: asks for clarification on vague spec before writing"
+    vars:
+      message: "add validation"
+    prompt: code_system
+    assert:
+      - type: llm-rubric
+        value: "The response asks what to validate rather than immediately writing code. It should request clarification about what fields, rules, or error messages are expected."
+
+  - description: "code: writes minimal code without extra abstractions"
+    vars:
+      message: "Write a function that adds two numbers"
+    prompt: code_system
+    assert:
+      - type: llm-rubric
+        value: "The response contains a short, simple function that adds two numbers. It does NOT add a class, factory, abstract base, config file, or anything beyond what was asked."
+      - type: not-contains
+        value: "class"
+
+  - description: "code: states interpretation before writing for ambiguous request"
+    vars:
+      message: "make it faster"
+    prompt: code_system
+    assert:
+      - type: llm-rubric
+        value: "The response asks for clarification about what code should be optimized, or explicitly states it cannot proceed without knowing what 'it' refers to. It does NOT invent a code example to optimize."
+
+  # ── Code: wraps output in code blocks ──────────────────────────────────────
+  - description: "code: always uses markdown code blocks"
+    vars:
+      message: "Write a JavaScript function that reverses a string"
+    prompt: code_system
+    assert:
+      - type: contains
+        value: "```"
+      - type: llm-rubric
+        value: "The code is wrapped in a markdown code block with a language tag (javascript or js)."
+
+  # ── Chat: concise responses ─────────────────────────────────────────────────
+  - description: "chat: gives direct answer to simple factual question"
+    vars:
+      today: "{{current_date}}"
+      message: "What is the capital of Japan?"
+    prompt: chat_system
+    assert:
+      - type: contains
+        value: "Tokyo"
+      - type: llm-rubric
+        value: "The response directly states Tokyo as the capital. It is concise and does not add unnecessary caveats."
+
+  # ── Code: no silent scope creep ────────────────────────────────────────────
+  - description: "code: does not add unrequested features"
+    vars:
+      message: "Write a function that returns the square of a number"
+    prompt: code_system
+    assert:
+      - type: llm-rubric
+        value: "The response contains only a simple square function. It does NOT add error handling for non-numbers, input validation, a cube function, or any other unrequested feature."
