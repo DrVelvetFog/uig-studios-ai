@@ -2251,7 +2251,8 @@ export default function App() {
   const [modelSearch, setModelSearch] = useState("");
   const [imgSettings, setImgSettings] = useState({ backend:"a1111", size:"512×512", steps:20, cfg:7, negPrompt:"blurry, deformed, ugly, bad anatomy", comfyCheckpoint:"" });
   const [comfyCheckpoints, setComfyCheckpoints] = useState([]); // populated when ComfyUI is online
-  const [braveApiKey, setBraveApiKey] = useState(() => localStorage.getItem("tonyai-brave-key") || "");
+  const [braveApiKey, setBraveApiKey] = useState("");   // loaded from Rust secret store on mount (see effect below)
+  const secretsLoadedRef = useRef(false);
   const [smartRoute, setSmartRoute] = useState(() => localStorage.getItem("tonyai-smart-route") !== "false");
   const [showAgentPanel, setAgentPanel] = useState(false);
   const [showInbox, setShowInbox]       = useState(false);
@@ -2294,7 +2295,30 @@ export default function App() {
     localStorage.setItem("tonyai-theme", isDark ? "dark" : "light");
   }, [isDark]);
 
-  useEffect(() => { localStorage.setItem("tonyai-brave-key", braveApiKey); }, [braveApiKey]);
+  // Load the search API key from Rust-managed secret storage (~/.tonyai/secret-brave.txt,
+  // mode 0600) — kept out of localStorage so untrusted page content can't scrape it.
+  // One-time migration: if a legacy localStorage key exists, move it into the store.
+  useEffect(() => {
+    (async () => {
+      try {
+        let v = await invoke("read_secret", { key: "brave" });
+        if (!v) {
+          const legacy = localStorage.getItem("tonyai-brave-key");
+          if (legacy) { v = legacy; await invoke("save_secret", { key: "brave", value: legacy }); }
+        }
+        localStorage.removeItem("tonyai-brave-key");   // never keep the secret in localStorage
+        if (v) setBraveApiKey(v);
+      } catch (e) { console.error("secret load failed", e); }
+      secretsLoadedRef.current = true;
+    })();
+  }, []);
+
+  // Persist the key back to the Rust store on change — but only after the initial
+  // load completes, so the empty starting value doesn't overwrite a stored key.
+  useEffect(() => {
+    if (!secretsLoadedRef.current) return;
+    invoke("save_secret", { key: "brave", value: braveApiKey }).catch(e => console.error("secret save failed", e));
+  }, [braveApiKey]);
   useEffect(() => { localStorage.setItem("tonyai-smart-route", smartRoute); }, [smartRoute]);
   useEffect(() => { localStorage.setItem("tonyai-confirm-cmds", confirmCmds); }, [confirmCmds]);
   useEffect(() => { localStorage.setItem("tonyai-rag-dir", ragSourceDir); }, [ragSourceDir]);

@@ -226,6 +226,35 @@ fn save_memory(content: String) -> Result<(), String> {
     std::fs::write(&path, content).map_err(|e| e.to_string())
 }
 
+// ── Secret storage ────────────────────────────────────────────────────────────
+// API keys live in ~/.tonyai/secret-<key>.txt (mode 0600), NOT in the webview's
+// localStorage — so untrusted page content rendered in the agent cannot scrape them.
+// One file per key; key charset is restricted to block path traversal.
+fn secret_key_ok(key: &str) -> bool {
+    !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+#[tauri::command]
+fn save_secret(key: String, value: String) -> Result<(), String> {
+    if !secret_key_ok(&key) { return Err("invalid secret key".to_string()); }
+    let path = tonyai_dir()?.join(format!("secret-{}.txt", key));
+    std::fs::write(&path, value).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn read_secret(key: String) -> Result<String, String> {
+    if !secret_key_ok(&key) { return Err("invalid secret key".to_string()); }
+    let path = tonyai_dir()?.join(format!("secret-{}.txt", key));
+    if !path.exists() { return Ok(String::new()); }
+    std::fs::read_to_string(&path).map_err(|e| e.to_string())
+}
+
 /// Read all memory .md files from ~/TonyAI-Projects/memory/.
 /// Returns JSON object: { "global": "...", "chat": "...", ... }
 #[tauri::command]
@@ -1375,6 +1404,8 @@ pub fn run() {
             save_memory,
             read_memory_files,
             save_memory_file,
+            save_secret,
+            read_secret,
             read_inbox,
             save_inbox,
             ollama_tags,
