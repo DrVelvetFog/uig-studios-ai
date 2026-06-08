@@ -255,6 +255,26 @@ fn read_secret(key: String) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| e.to_string())
 }
 
+// ── Diagnostic log ────────────────────────────────────────────────────────────
+// Appends a single pre-formatted line to ~/.tonyai/logs/tonyai.log. Rotates to
+// tonyai.log.1 once the file exceeds 2 MB so it can't grow unbounded.
+#[tauri::command]
+fn append_log(line: String) -> Result<(), String> {
+    use std::io::Write;
+    let dir = tonyai_dir()?.join("logs");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("tonyai.log");
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 2 * 1024 * 1024 {
+            let _ = std::fs::rename(&path, dir.join("tonyai.log.1"));
+        }
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true).append(true).open(&path)
+        .map_err(|e| e.to_string())?;
+    writeln!(f, "{}", line).map_err(|e| e.to_string())
+}
+
 /// Read all memory .md files from ~/TonyAI-Projects/memory/.
 /// Returns JSON object: { "global": "...", "chat": "...", ... }
 #[tauri::command]
@@ -1446,6 +1466,7 @@ pub fn run() {
             save_memory_file,
             save_secret,
             read_secret,
+            append_log,
             read_inbox,
             save_inbox,
             ollama_tags,

@@ -6,6 +6,7 @@ import mascot from "./assets/mascot.png";
 import { classifyPrompt } from "./classifyPrompt.js";
 import { isMutatingTool, guardToolCall, toolApprovalDetail, wrapUntrustedContent } from "./toolGuard.js";
 import { CODE_EXTS_SET, extractToolCallFromText, validateToolArgs, enrichToolError, neededSearchButSkipped, evaluateStopCondition } from "./agentLogic.js";
+import { installGlobalErrorLogging, logError } from "./logger.js";
 
 // ── Theme bootstrap — runs at module load, before React mounts ────────────────
 // Applies data-theme immediately so CSS variables are correct on first paint.
@@ -2157,6 +2158,9 @@ export default function App() {
     localStorage.setItem("tonyai-theme", isDark ? "dark" : "light");
   }, [isDark]);
 
+  // Record uncaught errors / promise rejections to the on-disk diagnostic log.
+  useEffect(() => { installGlobalErrorLogging(); }, []);
+
   // Load the search API key from Rust-managed secret storage (~/.tonyai/secret-brave.txt,
   // mode 0600) — kept out of localStorage so untrusted page content can't scrape it.
   // One-time migration: if a legacy localStorage key exists, move it into the store.
@@ -2170,7 +2174,7 @@ export default function App() {
         }
         localStorage.removeItem("tonyai-brave-key");   // never keep the secret in localStorage
         if (v) setBraveApiKey(v);
-      } catch (e) { console.error("secret load failed", e); }
+      } catch (e) { logError("secret load failed", String(e)); }
       secretsLoadedRef.current = true;
     })();
   }, []);
@@ -2179,7 +2183,7 @@ export default function App() {
   // load completes, so the empty starting value doesn't overwrite a stored key.
   useEffect(() => {
     if (!secretsLoadedRef.current) return;
-    invoke("save_secret", { key: "brave", value: braveApiKey }).catch(e => console.error("secret save failed", e));
+    invoke("save_secret", { key: "brave", value: braveApiKey }).catch(e => logError("secret save failed", String(e)));
   }, [braveApiKey]);
   useEffect(() => { localStorage.setItem("tonyai-smart-route", smartRoute); }, [smartRoute]);
   useEffect(() => { localStorage.setItem("tonyai-confirm-cmds", confirmCmds); }, [confirmCmds]);
@@ -3618,6 +3622,7 @@ After getting results, give your final answer in normal markdown. Never include 
                   else toolResult = `Unknown tool: ${fnName}. Available: ${modeToolSet.map(t => t.function.name).join(", ")}`;
                 } catch(e) {
                   toolResult = enrichToolError(fnName, e);
+                  logError(`tool '${fnName}' failed`, String(e));
                 }
               }
 
