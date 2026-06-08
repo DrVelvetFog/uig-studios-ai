@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { fetch } from "@tauri-apps/plugin-http";   // kept for A1111 / ComfyUI only
 import mascot from "./assets/mascot.png";
 import { classifyPrompt } from "./classifyPrompt.js";
-import { isMutatingTool, guardToolCall, toolApprovalDetail } from "./toolGuard.js";
+import { isMutatingTool, guardToolCall, toolApprovalDetail, wrapUntrustedContent } from "./toolGuard.js";
 
 // ── Theme bootstrap — runs at module load, before React mounts ────────────────
 // Applies data-theme immediately so CSS variables are correct on first paint.
@@ -1797,7 +1797,7 @@ async function runSubagent({ role, task, model, signal, braveApiKey, onProgress 
           } else
           try {
             if      (fnName === "web_search")   toolResult = await invoke("tool_web_search",   { query: fnArgs.query,   braveApiKey: braveApiKey||"" });
-            else if (fnName === "fetch_url")    toolResult = await invoke("tool_fetch_url",    { url: fnArgs.url });
+            else if (fnName === "fetch_url")    toolResult = wrapUntrustedContent(fnArgs.url, await invoke("tool_fetch_url", { url: fnArgs.url }));
             else if (fnName === "read_file")    toolResult = await invoke("tool_read_file",    { path: fnArgs.path });
             else if (fnName === "list_dir")     toolResult = await invoke("tool_list_dir",     { path: fnArgs.path });
             else if (fnName === "search_files") toolResult = await invoke("tool_search_files", { dir: fnArgs.dir, pattern: fnArgs.pattern, extensions: fnArgs.extensions ?? null, maxResults: fnArgs.max_results ?? null });
@@ -3278,6 +3278,11 @@ MEMORY: If you learn a user preference, project constraint, correction, or recur
         // Tracks every completed tool step this session — used by the stop condition evaluator
         const loopToolSteps = [];
 
+        // Prompt-injection provenance: flips true once untrusted web content (fetch_url /
+        // deep_search) enters context this turn. While true, any state-changing tool must
+        // be human-approved even if confirmCmds is off. Resets each send().
+        let sawWebContent = false;
+
         // Prompt-based fallback — lists only the active mode's tools so the model
         // doesn't try to call tools outside its scope
         const activeToolNames = modeToolSet.map(t => t.function.name).join(", ");
@@ -3497,10 +3502,14 @@ After getting results, give your final answer in normal markdown. Never include 
                 toolBlocked = true;
                 toolResult = `⛔ Blocked for safety: ${safetyGuard.reason}. This operation is not allowed.`;
               }
-              // Layer 2 — interactive approval for any state-changing tool when confirmCmds is on.
-              else if (confirmCmds && isMutatingTool(fnName)) {
+              // Layer 2 — interactive approval for any state-changing tool.
+              // Required when confirmCmds is on, OR (regardless of that setting) once
+              // untrusted web content has entered context this turn — the prompt-injection
+              // guardrail: a human must sign off before web-influenced side effects run.
+              else if ((confirmCmds || sawWebContent) && isMutatingTool(fnName)) {
+                const detail = (sawWebContent ? "⚠ web content in context — " : "") + toolApprovalDetail(fnName, fnArgs);
                 try {
-                  await requestToolPermission(fnName, toolApprovalDetail(fnName, fnArgs));
+                  await requestToolPermission(fnName, detail);
                 } catch {
                   toolBlocked = true;
                   toolResult = "⛔ Blocked by user";
@@ -3571,9 +3580,13 @@ After getting results, give your final answer in normal markdown. Never include 
                         parts.push(`\n### ${r.domain}\n_Source: ${r.url}_\n\n${r.content}`);
                       }
                     }
-                    toolResult = parts.join("\n");
+                    toolResult = wrapUntrustedContent(`deep_search: ${fnArgs.query}`, parts.join("\n"));
+                    sawWebContent = true;
                   }
-                  else if (fnName === "fetch_url")    toolResult = await invoke("tool_fetch_url",    { url: fnArgs.url });
+                  else if (fnName === "fetch_url") {
+                    toolResult = wrapUntrustedContent(fnArgs.url, await invoke("tool_fetch_url", { url: fnArgs.url }));
+                    sawWebContent = true;
+                  }
                   else if (fnName === "read_file")    toolResult = await invoke("tool_read_file",    { path: fnArgs.path });
                   else if (fnName === "list_dir")     toolResult = await invoke("tool_list_dir",     { path: fnArgs.path });
                   else if (fnName === "search_files") toolResult = await invoke("tool_search_files", { dir: fnArgs.dir, pattern: fnArgs.pattern, extensions: fnArgs.extensions ?? null, maxResults: fnArgs.max_results ?? null });
