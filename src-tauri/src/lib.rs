@@ -586,6 +586,49 @@ fn ddg_html_scrape(html: &str, query: &str) -> String {
     }
 }
 
+/// No-key search via DuckDuckGo HTML, with graceful, descriptive failure.
+/// Used both as the no-key path and as the fallback when a keyed provider errors.
+async fn ddg_search(client: &reqwest::Client, query: &str) -> String {
+    match client
+        .get("https://html.duckduckgo.com/html/")
+        .query(&[("q", query)])
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .send().await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.text().await {
+            Ok(html) => ddg_html_scrape(&html, query),
+            Err(e)   => format!("Search unavailable (DuckDuckGo read error: {}). Add a Serper.dev or Brave API key for reliable search.", e),
+        },
+        Ok(resp) => format!("Search unavailable (DuckDuckGo HTTP {}). Add a Serper.dev or Brave API key for reliable search.", resp.status()),
+        Err(e)   => format!("Search unavailable (DuckDuckGo unreachable: {}). Add a Serper.dev or Brave API key for reliable search.", e),
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    #[test]
+    fn scrapes_title_url_snippet() {
+        let html = r#"
+            <div class="result__body">
+              <a class="result__a" href="x">Rust Async Book</a>
+              <span class="result__url">rust-lang.github.io</span>
+              <a class="result__snippet">Learn async Rust here.</a>
+            </div>"#;
+        let out = ddg_html_scrape(html, "rust async");
+        assert!(out.contains("[1] Rust Async Book"), "got: {out}");
+        assert!(out.contains("rust-lang.github.io"), "got: {out}");
+        assert!(out.contains("Learn async Rust here."), "got: {out}");
+    }
+
+    #[test]
+    fn empty_html_reports_no_results() {
+        let out = ddg_html_scrape("<html><body>nothing here</body></html>", "q");
+        assert!(out.starts_with("No results scraped"), "got: {out}");
+    }
+}
+
 /// Web search: auto-detects provider from API key format.
 /// - Key starts with "BSA" → Brave Search API
 /// - Any other non-empty key → Serper.dev (Google results, serper.dev)
@@ -621,68 +664,65 @@ async fn tool_web_search(query: String, brave_api_key: String) -> Result<String,
     }
 
     // ── Brave Search API (key starts with "BSA") ─────────────────────────────────
+    // On any failure (network, HTTP error, quota, empty/unparseable) we degrade to
+    // DuckDuckGo rather than hard-failing, so search keeps working.
     if key.starts_with("BSA") {
-        let resp = client
+        if let Ok(resp) = client
             .get("https://api.search.brave.com/res/v1/web/search")
             .query(&[("q", query.as_str()), ("count", "6"), ("text_decorations", "0")])
             .header("Accept", "application/json")
             .header("X-Subscription-Token", key.as_str())
             .send().await
-            .map_err(|e| format!("Brave Search failed: {}", e))?;
-        if !resp.status().is_success() {
-            return Err(format!("Brave Search HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default()));
-        }
-        let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-        let mut results = Vec::new();
-        if let Some(items) = json.get("web").and_then(|w| w.get("results")).and_then(|r| r.as_array()) {
-            for (i, item) in items.iter().take(6).enumerate() {
-                let title   = item.get("title").and_then(|v| v.as_str()).unwrap_or("?");
-                let url     = item.get("url").and_then(|v| v.as_str()).unwrap_or("?");
-                let snippet = item.get("description").and_then(|v| v.as_str()).unwrap_or("");
-                results.push(format!("[{}] {}\n    URL: {}\n    {}", i+1, title, url, snippet));
+        {
+            if resp.status().is_success() {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    let mut results = Vec::new();
+                    if let Some(items) = json.get("web").and_then(|w| w.get("results")).and_then(|r| r.as_array()) {
+                        for (i, item) in items.iter().take(6).enumerate() {
+                            let title   = item.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+                            let url     = item.get("url").and_then(|v| v.as_str()).unwrap_or("?");
+                            let snippet = item.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                            results.push(format!("[{}] {}\n    URL: {}\n    {}", i+1, title, url, snippet));
+                        }
+                    }
+                    if !results.is_empty() { return Ok(results.join("\n\n")); }
+                }
             }
         }
-        return Ok(if results.is_empty() { "No results found.".into() } else { results.join("\n\n") });
+        return Ok(ddg_search(&client, &query).await);
     }
 
     // ── Serper.dev (any other non-empty key = Google results) ────────────────────
+    // Same graceful-degradation behaviour as Brave.
     if !key.is_empty() {
         let body = serde_json::json!({ "q": query, "num": 6 });
-        let resp = client
+        if let Ok(resp) = client
             .post("https://google.serper.dev/search")
             .header("X-API-KEY", key.as_str())
             .header("Content-Type", "application/json")
             .body(body.to_string())
             .send().await
-            .map_err(|e| format!("Serper.dev failed: {}", e))?;
-        if !resp.status().is_success() {
-            return Err(format!("Serper.dev HTTP {}: {}", resp.status(), resp.text().await.unwrap_or_default()));
-        }
-        let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-        let mut results = Vec::new();
-        if let Some(items) = json.get("organic").and_then(|r| r.as_array()) {
-            for (i, item) in items.iter().take(6).enumerate() {
-                let title   = item.get("title").and_then(|v| v.as_str()).unwrap_or("?");
-                let url     = item.get("link").and_then(|v| v.as_str()).unwrap_or("?");
-                let snippet = item.get("snippet").and_then(|v| v.as_str()).unwrap_or("");
-                results.push(format!("[{}] {}\n    URL: {}\n    {}", i+1, title, url, snippet));
+        {
+            if resp.status().is_success() {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    let mut results = Vec::new();
+                    if let Some(items) = json.get("organic").and_then(|r| r.as_array()) {
+                        for (i, item) in items.iter().take(6).enumerate() {
+                            let title   = item.get("title").and_then(|v| v.as_str()).unwrap_or("?");
+                            let url     = item.get("link").and_then(|v| v.as_str()).unwrap_or("?");
+                            let snippet = item.get("snippet").and_then(|v| v.as_str()).unwrap_or("");
+                            results.push(format!("[{}] {}\n    URL: {}\n    {}", i+1, title, url, snippet));
+                        }
+                    }
+                    if !results.is_empty() { return Ok(results.join("\n\n")); }
+                }
             }
         }
-        return Ok(if results.is_empty() { "No results found.".into() } else { results.join("\n\n") });
+        return Ok(ddg_search(&client, &query).await);
     }
 
-    // ── No key: DuckDuckGo HTML scrape ───────────────────────────────────────────
-    let resp = client
-        .get("https://html.duckduckgo.com/html/")
-        .query(&[("q", query.as_str())])
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .send().await
-        .map_err(|e| format!("DuckDuckGo request failed: {}", e))?;
-    if !resp.status().is_success() {
-        return Err(format!("DuckDuckGo HTTP {}", resp.status()));
-    }
-    let html = resp.text().await.map_err(|e| e.to_string())?;
-    Ok(ddg_html_scrape(&html, &query))
+    // ── No key: DuckDuckGo ───────────────────────────────────────────────────────
+    Ok(ddg_search(&client, &query).await)
 }
 
 /// Fetch a URL and return its readable text content (HTML stripped).
