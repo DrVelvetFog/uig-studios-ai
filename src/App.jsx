@@ -1714,6 +1714,7 @@ async function runSubagent({ role, task, model, signal, braveApiKey, onProgress 
   const steps = [];
   let loopCount = 0;
   let usePromptTools = false;
+  let lastContent = "";   // most recent substantive assistant text — for max-iter salvage
 
   while (loopCount < 8) {
     loopCount++;
@@ -1745,6 +1746,7 @@ async function runSubagent({ role, task, model, signal, braveApiKey, onProgress 
     const resp    = JSON.parse(raw);
     const content = resp.message?.content || "";
     let toolCalls = resp.message?.tool_calls || [];
+    if (content.trim()) lastContent = content;   // remember for salvage if we hit the cap
 
     // Empty response with no tool calls and no content → model silently rejected
     // native tool schema. Switch to prompt-fallback and retry this iteration.
@@ -1818,7 +1820,25 @@ async function runSubagent({ role, task, model, signal, braveApiKey, onProgress 
       subMsgs.push({ role:"tool",      content: String(toolResult), tool_call_id: tc.id||`sub_${Date.now()}` });
     }
   }
-  return { result: "Subagent reached max iterations without completing.", steps };
+  // Max iterations reached — salvage partial work rather than discarding it, so the
+  // parent agent can still use whatever the subagent gathered.
+  const doneSteps = steps.filter(s => s.status === "done");
+  const digest = doneSteps.slice(-6).map(s => {
+    const r = String(s.result || "").replace(/\s+/g, " ").trim().slice(0, 300);
+    let a = ""; try { a = JSON.stringify(s.args).slice(0, 80); } catch { a = ""; }
+    return `• ${s.name}(${a}) → ${r}`;
+  }).join("\n");
+  const salvaged = [
+    lastContent.trim() ? `Partial findings before the step limit:\n${lastContent.trim()}` : "",
+    digest ? `\nTool results gathered (${doneSteps.length} successful step(s)):\n${digest}` : "",
+  ].filter(Boolean).join("\n").trim();
+  return {
+    result: salvaged
+      ? `⚠️ Subagent hit its ${loopCount}-step limit before reaching a final answer. ${salvaged}`
+      : `⚠️ Subagent reached its ${loopCount}-step limit without producing usable output.`,
+    steps,
+    incomplete: true,
+  };
 }
 
 // ── Coder pipeline: coder → verifier → fixer ─────────────────────────────────
