@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { fetch } from "@tauri-apps/plugin-http";   // kept for A1111 / ComfyUI only
 import mascot from "./assets/mascot.png";
 import { classifyPrompt } from "./classifyPrompt.js";
+import { isMutatingTool, guardToolCall, toolApprovalDetail } from "./toolGuard.js";
 
 // ── Theme bootstrap — runs at module load, before React mounts ────────────────
 // Applies data-theme immediately so CSS variables are correct on first paint.
@@ -1787,6 +1788,13 @@ async function runSubagent({ role, task, model, signal, braveApiKey, onProgress 
           toolResult = `Error: ${valid.error}`;
           step.status = "error";
         } else {
+          // Hard safety denylist — non-bypassable. Subagents run autonomously with
+          // no UI approval prompt, so catastrophic ops are simply refused here.
+          const guard = guardToolCall(fnName, fnArgs);
+          if (guard.blocked) {
+            toolResult = `⛔ Blocked for safety: ${guard.reason}. This operation is not allowed.`;
+            step.status = "error";
+          } else
           try {
             if      (fnName === "web_search")   toolResult = await invoke("tool_web_search",   { query: fnArgs.query,   braveApiKey: braveApiKey||"" });
             else if (fnName === "fetch_url")    toolResult = await invoke("tool_fetch_url",    { url: fnArgs.url });
@@ -2230,7 +2238,7 @@ export default function App() {
   const [inbox, setInbox]               = useState([]);
   const [compactNotice, setCompactNotice] = useState("");
   const [confirmCmds, setConfirmCmds] = useState(() => localStorage.getItem("tonyai-confirm-cmds") !== "false");
-  const [pendingCmd,  setPendingCmd]   = useState(null); // null | command string — awaiting user approval
+  const [pendingCmd,  setPendingCmd]   = useState(null); // null | { name, detail } — awaiting user approval
   const pendingCmdRef = useRef(null);
   const [homeDir, setHomeDir] = useState("/Users/tonyjagodka"); // populated from Rust at bootstrap
   // MCP server configurations (persisted to localStorage)
@@ -2948,11 +2956,12 @@ export default function App() {
     setLoading(false);
   }
 
-  // Permission gate helpers — used by agent loop before run_command
-  function requestCmdPermission(command) {
+  // Permission gate helpers — used by agent loop before any state-changing tool
+  // (run_command, write_file, python_exec, MCP). Resolves on Allow, rejects on Deny.
+  function requestToolPermission(name, detail) {
     return new Promise((resolve, reject) => {
       pendingCmdRef.current = { resolve, reject };
-      setPendingCmd(command);
+      setPendingCmd({ name, detail: detail || "" });
     });
   }
   function allowCmd() { pendingCmdRef.current?.resolve(); setPendingCmd(null); }
@@ -3482,13 +3491,19 @@ After getting results, give your final answer in normal markdown. Never include 
                 return u;
               });
 
-              // run_command needs user approval when confirmCmds is on
-              if (fnName === "run_command" && confirmCmds) {
+              // Layer 1 — hard safety denylist (non-bypassable, ignores confirmCmds).
+              const safetyGuard = guardToolCall(fnName, fnArgs);
+              if (safetyGuard.blocked) {
+                toolBlocked = true;
+                toolResult = `⛔ Blocked for safety: ${safetyGuard.reason}. This operation is not allowed.`;
+              }
+              // Layer 2 — interactive approval for any state-changing tool when confirmCmds is on.
+              else if (confirmCmds && isMutatingTool(fnName)) {
                 try {
-                  await requestCmdPermission(fnArgs.command || "");
+                  await requestToolPermission(fnName, toolApprovalDetail(fnName, fnArgs));
                 } catch {
                   toolBlocked = true;
-                  toolResult = "⛔ Command blocked by user";
+                  toolResult = "⛔ Blocked by user";
                 }
               }
 
@@ -4529,12 +4544,12 @@ After getting results, give your final answer in normal markdown. Never include 
           </div>{/* /inner-column */}
         </div>
 
-        {/* run_command permission gate */}
+        {/* tool permission gate */}
         {pendingCmd !== null && (
           <div style={{ padding:"8px 18px", background:"rgba(234,179,8,0.07)", borderTop:"1px solid rgba(234,179,8,0.22)", display:"flex", alignItems:"center", gap:10, flexShrink:0 }}>
             <span style={{ fontSize:13, flexShrink:0 }}>⚠️</span>
-            <span style={{ fontSize:11, color:"var(--tny-tx3)", flexShrink:0, fontWeight:600 }}>run_command</span>
-            <code style={{ flex:1, fontSize:11, color:"#fbbf24", fontFamily:"'JetBrains Mono',monospace", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", minWidth:0 }}>{pendingCmd}</code>
+            <span style={{ fontSize:11, color:"var(--tny-tx3)", flexShrink:0, fontWeight:600 }}>{pendingCmd.name}</span>
+            <code style={{ flex:1, fontSize:11, color:"#fbbf24", fontFamily:"'JetBrains Mono',monospace", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", minWidth:0 }}>{pendingCmd.detail}</code>
             <button onClick={allowCmd} style={{ background:"rgba(34,197,94,0.14)", border:"1px solid rgba(34,197,94,0.35)", color:"#22c55e", cursor:"pointer", borderRadius:6, padding:"4px 14px", fontSize:11, fontFamily:"inherit", fontWeight:600, flexShrink:0 }}>Allow</button>
             <button onClick={denyCmd}  style={{ background:"none", border:"1px solid var(--tny-line2)", color:"var(--tny-tx4)", cursor:"pointer", borderRadius:6, padding:"4px 10px", fontSize:11, fontFamily:"inherit", flexShrink:0 }}>Deny</button>
           </div>
