@@ -4,8 +4,8 @@ import { listen } from "@tauri-apps/api/event";
 import { fetch } from "@tauri-apps/plugin-http";   // kept for A1111 / ComfyUI only
 import mascot from "./assets/mascot.png";
 import { classifyPrompt } from "./classifyPrompt.js";
-import { isMutatingTool, guardToolCall, toolApprovalDetail, wrapUntrustedContent } from "./toolGuard.js";
-import { CODE_EXTS_SET, extractToolCallFromText, validateToolArgs, enrichToolError, neededSearchButSkipped, evaluateStopCondition } from "./agentLogic.js";
+import { isMutatingTool, guardToolCall, toolApprovalDetail, wrapUntrustedContent, suggestAllowPattern, isAllowlisted } from "./toolGuard.js";
+import { CODE_EXTS_SET, extractToolCallFromText, validateToolArgs, enrichToolError, neededSearchButSkipped, evaluateStopCondition, approvalDiffFor, aggregateTelemetry } from "./agentLogic.js";
 import { installGlobalErrorLogging, logError } from "./logger.js";
 import { renderMessage, TypingDots } from "./render.jsx";
 import { DevInspectPanel } from "./components/DevInspectPanel.jsx";
@@ -244,6 +244,8 @@ AVAILABLE TOOLS:
 - read_file(path): Read a file from the local filesystem (restricted to $HOME)
 - list_dir(path): List contents of a directory
 - run_command(command): Execute a shell command (pm2, git, npm, curl, etc.)
+- write_file(path, content): Create a NEW file
+- edit_file(path, old_string, new_string): Change an EXISTING file by exact search/replace — always prefer this over write_file for modifications; read_file first and copy old_string exactly
 
 SOURCE ACCURACY — mandatory:
 - Never fabricate statistics, prices, dates, or specific facts — only state what appeared in actual search results or fetched pages
@@ -274,13 +276,10 @@ Before starting any task that involves:
 - Refactoring that touches more than one module
 - Any operation where the wrong approach wastes significant effort
 
-Present a numbered plan FIRST:
-1. What you will do, in what order
-2. What approach you're taking and why (if there were alternatives)
-3. Any assumptions you're making that the user should confirm
-4. Estimated scope (how many files, commands, steps)
-
-Then STOP and wait for confirmation ("go ahead", "yes", "do it") before executing step 1.
+Call the propose_plan tool with a title and numbered steps. The user gets Approve /
+Request-changes buttons. Only execute after the result says the plan was APPROVED;
+if changes are requested, revise and call propose_plan again. Do NOT write plans as
+plain text and wait — always use the tool so the user gets real buttons.
 
 EXCEPTION — skip the plan and just act for:
 - Single-file edits with a clear, unambiguous change
@@ -745,14 +744,77 @@ function chunkDocument(content, filePath, { maxSize = 1000, minSize = 40 } = {})
 }
 
 // ── Session persistence ───────────────────────────────────────────────────────
-const SESSION_KEY = "tonyai-sessions-v1";
+// Sessions live on disk (~/.tonyai/sessions/, one JSON each) via Rust commands —
+// localStorage's ~5MB quota silently corrupted long histories. Legacy
+// localStorage sessions are migrated once at bootstrap. Generated images are
+// extracted to ~/.tonyai/session-images/ and stored by path reference.
+const SESSION_KEY = "tonyai-sessions-v1";   // legacy key — read once for migration
 const ACTIVE_KEY  = "tonyai-active-session";
 
 function loadSessions() {
   try { return JSON.parse(localStorage.getItem(SESSION_KEY)) || null; } catch { return null; }
 }
+
+let diskSaveTimer = null;
+const lastWrittenJson = new Map();  // sessionId → last JSON written (skip unchanged)
+const extractedImages = new Map();  // "<sessId>_<msgId>" → saved image path
+
+function dataUrlFromArrayBuffer(buf) {
+  const bytes = new Uint8Array(buf);
+  let binary = "";
+  for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+  return "data:image/png;base64," + btoa(binary);
+}
+
+// Disk-ready copy of a session: bulky attachment previews stripped, generated
+// images extracted to files and referenced by imagePath instead of a data URI.
+async function prepareSessionForDisk(session) {
+  const messages = [];
+  for (const m of (session.messages || [])) {
+    let msg = m;
+    if (msg.attachments?.length) {
+      msg = { ...msg, attachments: msg.attachments.map(a => ({ type: a.type, name: a.name })) };
+    }
+    if (msg.type === "image") {
+      if (msg.imageUrl && !msg.imagePath) {
+        const key = `${session.id}_${msg.id || "img"}`.replace(/[^a-zA-Z0-9_-]/g, "");
+        let path = extractedImages.get(key);
+        if (!path) {
+          try {
+            let b64 = msg.imageUrl;
+            if (b64.startsWith("blob:")) {
+              const resp = await window.fetch(b64);
+              b64 = dataUrlFromArrayBuffer(await resp.arrayBuffer());
+            }
+            if (b64.startsWith("data:")) {
+              path = await invoke("save_session_image", { name: key, base64: b64 });
+              extractedImages.set(key, path);
+            }
+          } catch { /* unextractable (revoked blob) — drop the pixels, keep the prompt */ }
+        }
+        msg = { ...msg, imagePath: path || undefined, imageUrl: undefined };
+      } else if (msg.imagePath) {
+        msg = { ...msg, imageUrl: undefined };
+      }
+    }
+    messages.push(msg);
+  }
+  return { ...session, messages };
+}
+
 function persistSessions(sessions) {
-  try { localStorage.setItem(SESSION_KEY, JSON.stringify(sessions)); } catch {}
+  clearTimeout(diskSaveTimer);
+  diskSaveTimer = setTimeout(async () => {
+    for (const s of sessions) {
+      try {
+        const prepared = await prepareSessionForDisk(s);
+        const json = JSON.stringify(prepared);
+        if (lastWrittenJson.get(s.id) === json) continue;
+        await invoke("save_session", { id: String(s.id), data: json });
+        lastWrittenJson.set(s.id, json);
+      } catch (e) { console.warn("[TonyAI] session save failed:", e); }
+    }
+  }, 800);
 }
 function persistActive(id) {
   try { localStorage.setItem(ACTIVE_KEY, String(id)); } catch {}
@@ -827,10 +889,22 @@ function ImageMessage({ msg }) {
   const [savedPath, setSavedPath] = useState(null);   // null | string path
   const [saving,    setSaving]    = useState(false);
   const [saveErr,   setSaveErr]   = useState(null);
+  // Display source: in-memory data/blob URL, or lazy-loaded from disk when the
+  // session was rehydrated and the image lives at imagePath by reference.
+  const [imgSrc, setImgSrc] = useState(msg.imageUrl || null);
+  useEffect(() => {
+    if (msg.imageUrl) { setImgSrc(msg.imageUrl); return; }
+    if (msg.imagePath) {
+      invoke("read_session_image", { path: msg.imagePath })
+        .then(setImgSrc)
+        .catch(() => setImgSrc(null));
+    }
+  }, [msg.imageUrl, msg.imagePath]);
 
   function browserDownload() {
+    if (!imgSrc) return;
     const a = document.createElement("a");
-    a.href = msg.imageUrl; a.download = `tonyai-${Date.now()}.png`; a.click();
+    a.href = imgSrc; a.download = `tonyai-${Date.now()}.png`; a.click();
   }
 
   async function saveToTonyAI() {
@@ -845,18 +919,15 @@ function ImageMessage({ msg }) {
       const filenameStem = `${timeStr}_${slug}`;
       const subdir = now.toISOString().slice(0,10); // "2026-05-29"
 
-      // Get base64 — imageUrl is either a data URI or a blob URL (ComfyUI)
+      // Get base64 — imgSrc is either a data URI or a blob URL (ComfyUI)
+      if (!imgSrc) throw new Error("image not loaded yet");
       let b64;
-      if (msg.imageUrl.startsWith("data:")) {
-        b64 = msg.imageUrl;
+      if (imgSrc.startsWith("data:")) {
+        b64 = imgSrc;
       } else {
         // blob URL — fetch it and convert
-        const resp = await fetch(msg.imageUrl);
-        const buf  = await resp.arrayBuffer();
-        const bytes = new Uint8Array(buf);
-        let binary = "";
-        for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
-        b64 = "data:image/png;base64," + btoa(binary);
+        const resp = await window.fetch(imgSrc);
+        b64 = dataUrlFromArrayBuffer(await resp.arrayBuffer());
       }
 
       // Build sidecar metadata
@@ -906,7 +977,13 @@ function ImageMessage({ msg }) {
       ) : (
         <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
           <div style={{ position:"relative", display:"inline-block" }}>
-            <img src={msg.imageUrl} alt={msg.prompt} style={{ borderRadius:12, maxWidth:480, width:"100%", display:"block", border:"1px solid var(--tny-line)" }}/>
+            {imgSrc ? (
+              <img src={imgSrc} alt={msg.prompt} style={{ borderRadius:12, maxWidth:480, width:"100%", display:"block", border:"1px solid var(--tny-line)" }}/>
+            ) : (
+              <div style={{ width:320, height:200, borderRadius:12, background:"var(--tny-surface)", border:"1px solid var(--tny-line)", display:"flex", alignItems:"center", justifyContent:"center", color:"var(--tny-tx4)", fontSize:12 }}>
+                {msg.imagePath ? "Loading image…" : "Image unavailable"}
+              </div>
+            )}
             <button onClick={browserDownload} title="Download to browser default location" style={{ position:"absolute", top:8, right:8, background:"rgba(0,0,0,0.7)", border:"1px solid #444", color:"#ccc", borderRadius:8, padding:"5px 10px", fontSize:11, cursor:"pointer", fontFamily:"inherit" }}>↓</button>
           </div>
 
@@ -1005,11 +1082,11 @@ function ImageSettings({ settings, onChange, backendStatus, checkpoints = [] }) 
 // e.g. chat mode accidentally triggering run_command.
 const MODE_TOOL_SETS = {
   // search_knowledge added to every mode that uses the agent loop
-  chat:   ["web_search", "deep_search", "fetch_url", "search_knowledge"],
-  code:   ["web_search", "deep_search", "fetch_url", "write_file", "read_file", "search_files", "list_dir", "run_command", "python_exec", "git_status", "git_diff", "git_log", "git_blame", "spawn_subagent", "search_knowledge"],
-  python: ["web_search", "deep_search", "fetch_url", "write_file", "read_file", "search_files", "list_dir", "run_command", "python_exec", "git_status", "git_diff", "git_log", "git_blame", "spawn_subagent", "search_knowledge"],
-  sui:    ["web_search", "deep_search", "fetch_url", "write_file", "read_file", "search_files", "list_dir", "run_command", "python_exec", "git_status", "git_diff", "git_log", "git_blame", "spawn_subagent", "search_knowledge"],
-  arb:    ["web_search", "deep_search", "fetch_url", "write_file", "read_file", "search_files", "list_dir", "run_command", "python_exec", "git_status", "git_diff", "git_log", "git_blame", "spawn_subagent", "search_knowledge"],
+  chat:   ["web_search", "deep_search", "fetch_url", "search_knowledge", "search_sessions"],
+  code:   ["web_search", "deep_search", "fetch_url", "propose_plan", "write_file", "edit_file", "read_file", "search_files", "list_dir", "run_command", "run_background", "process_status", "process_kill", "process_list", "python_exec", "git_status", "git_diff", "git_log", "git_blame", "spawn_subagent", "search_knowledge", "search_sessions"],
+  python: ["web_search", "deep_search", "fetch_url", "propose_plan", "write_file", "edit_file", "read_file", "search_files", "list_dir", "run_command", "run_background", "process_status", "process_kill", "process_list", "python_exec", "git_status", "git_diff", "git_log", "git_blame", "spawn_subagent", "search_knowledge", "search_sessions"],
+  sui:    ["web_search", "deep_search", "fetch_url", "propose_plan", "write_file", "edit_file", "read_file", "search_files", "list_dir", "run_command", "run_background", "process_status", "process_kill", "process_list", "python_exec", "git_status", "git_diff", "git_log", "git_blame", "spawn_subagent", "search_knowledge", "search_sessions"],
+  arb:    ["web_search", "deep_search", "fetch_url", "propose_plan", "write_file", "edit_file", "read_file", "search_files", "list_dir", "run_command", "run_background", "process_status", "process_kill", "process_list", "python_exec", "git_status", "git_diff", "git_log", "git_blame", "spawn_subagent", "search_knowledge", "search_sessions"],
   agent:  null,   // full AGENT_TOOLS — unrestricted orchestrator
   auto:   null,   // resolved at runtime to classified effectiveMode set
   image:  [],     // no text tools — handled by A1111/ComfyUI backends
@@ -1045,11 +1122,12 @@ Do not ask questions. Deliver research. End with TASK_COMPLETE on its own line.`
   },
   coder: {
     icon: "✏️", label: "Coder",
-    system: `You are a code implementation subagent. Write all required files using write_file.
+    system: `You are a code implementation subagent. Write new files using write_file; change
+existing files with edit_file (exact search/replace — read_file first to copy the exact text).
 Use list_dir to explore existing structure first. After writing, run the entry point with
 run_command to verify it works. Report: what files you created and whether the run succeeded.
 End with TASK_COMPLETE on its own line.`,
-    tools: ["write_file", "read_file", "search_files", "list_dir", "run_command"],
+    tools: ["write_file", "edit_file", "read_file", "search_files", "list_dir", "run_command"],
   },
   verifier: {
     icon: "🧪", label: "Verifier",
@@ -1061,16 +1139,18 @@ Be precise — no paraphrasing. End with TASK_COMPLETE on its own line.`,
   fixer: {
     icon: "🔧", label: "Fixer",
     system: `You are a code fixer subagent. You receive failing files and the error output from running them.
-Your job: read each file, understand the error, apply the minimal fix with write_file, then run it again with run_command to confirm [exit 0].
+Your job: read each file, understand the error, apply the minimal fix with edit_file (exact
+search/replace — copy old_string exactly from read_file output), then run it again with
+run_command to confirm [exit 0]. Use write_file only if the whole file must be rewritten.
 Be surgical — change only what the error requires. Report exactly what you changed.
 End with TASK_COMPLETE on its own line.`,
-    tools: ["write_file", "read_file", "run_command", "list_dir", "search_files"],
+    tools: ["write_file", "edit_file", "read_file", "run_command", "list_dir", "search_files"],
   },
 };
 
 // Headless agent loop — runs in complete isolation from the parent context window.
 // Returns { result: string, steps: [{name,args,status,result}] }
-async function runSubagent({ role, task, model, signal, braveApiKey, onProgress }) {
+async function runSubagent({ role, task, model, signal, braveApiKey, onProgress, checkpoint }) {
   const roleDef = SUBAGENT_ROLES[role] || SUBAGENT_ROLES.researcher;
   const allowedSet = new Set(roleDef.tools);
   // scopedTools is defined after AGENT_TOOLS — forward reference resolved at call time
@@ -1173,13 +1253,21 @@ async function runSubagent({ role, task, model, signal, braveApiKey, onProgress 
             step.status = "error";
           } else
           try {
+            // Snapshot pre-mutation state into the parent turn's checkpoint
+            if ((fnName === "write_file" || fnName === "edit_file") && checkpoint) {
+              try {
+                await invoke("checkpoint_file", { turnId: checkpoint.id, path: fnArgs.path });
+                checkpoint.mutatedPaths.add(fnArgs.path);
+              } catch {}
+            }
             if      (fnName === "web_search")   toolResult = await invoke("tool_web_search",   { query: fnArgs.query,   braveApiKey: braveApiKey||"" });
             else if (fnName === "fetch_url")    toolResult = wrapUntrustedContent(fnArgs.url, await invoke("tool_fetch_url", { url: fnArgs.url }));
             else if (fnName === "read_file")    toolResult = await invoke("tool_read_file",    { path: fnArgs.path });
             else if (fnName === "list_dir")     toolResult = await invoke("tool_list_dir",     { path: fnArgs.path });
             else if (fnName === "search_files") toolResult = await invoke("tool_search_files", { dir: fnArgs.dir, pattern: fnArgs.pattern, extensions: fnArgs.extensions ?? null, maxResults: fnArgs.max_results ?? null });
-            else if (fnName === "run_command")  toolResult = await invoke("tool_run_command",  { command: fnArgs.command });
+            else if (fnName === "run_command")  toolResult = await invoke("tool_run_command",  { command: fnArgs.command, timeoutSeconds: null });
             else if (fnName === "write_file")   toolResult = await invoke("tool_write_file",   { path: fnArgs.path, content: fnArgs.content });
+            else if (fnName === "edit_file")    toolResult = await invoke("tool_edit_file",    { path: fnArgs.path, oldString: fnArgs.old_string, newString: fnArgs.new_string, replaceAll: fnArgs.replace_all ?? null });
             else toolResult = `Unknown tool: ${fnName}`;
             step.status = "done";
           } catch(e) {
@@ -1220,7 +1308,7 @@ async function runSubagent({ role, task, model, signal, braveApiKey, onProgress 
 // Wraps runSubagent to auto-chain verification and fixing.
 // Returns { result, steps, pipelineStages }
 // pipelineStages: [{ role, icon, label, steps, status, result }]
-async function runCoderPipeline({ task, model, signal, braveApiKey, onStageUpdate }) {
+async function runCoderPipeline({ task, model, signal, braveApiKey, onStageUpdate, checkpoint }) {
   const pipelineStages = [];
   let allSteps = [];
 
@@ -1229,7 +1317,7 @@ async function runCoderPipeline({ task, model, signal, braveApiKey, onStageUpdat
   onStageUpdate?.([...pipelineStages], []);
 
   const coderResult = await runSubagent({
-    role: "coder", task, model, signal, braveApiKey,
+    role: "coder", task, model, signal, braveApiKey, checkpoint,
     onProgress: (steps) => {
       pipelineStages[0] = { ...pipelineStages[0], steps };
       onStageUpdate?.([...pipelineStages], steps);
@@ -1258,7 +1346,7 @@ async function runCoderPipeline({ task, model, signal, braveApiKey, onStageUpdat
   onStageUpdate?.([...pipelineStages], allSteps);
 
   const verifierResult = await runSubagent({
-    role: "verifier", task: verifierTask, model, signal, braveApiKey,
+    role: "verifier", task: verifierTask, model, signal, braveApiKey, checkpoint,
     onProgress: (steps) => {
       pipelineStages[1] = { ...pipelineStages[1], steps };
       onStageUpdate?.([...pipelineStages], [...allSteps, ...steps]);
@@ -1298,7 +1386,7 @@ async function runCoderPipeline({ task, model, signal, braveApiKey, onStageUpdat
     onStageUpdate?.([...pipelineStages], allSteps);
 
     const fixerResult = await runSubagent({
-      role: "fixer", task: fixerTask, model, signal, braveApiKey,
+      role: "fixer", task: fixerTask, model, signal, braveApiKey, checkpoint,
       onProgress: (steps) => {
         pipelineStages[stageIdx] = { ...pipelineStages[stageIdx], steps };
         onStageUpdate?.([...pipelineStages], [...allSteps, ...steps]);
@@ -1333,10 +1421,17 @@ const AGENT_TOOLS = [
   { type:"function", function:{ name:"fetch_url",   description:"Fetch and read the full text content of a specific URL. Use after web_search to get full page details.", parameters:{ type:"object", properties:{ url:{ type:"string", description:"The URL to fetch" }}, required:["url"] }}},
   { type:"function", function:{ name:"read_file",   description:"Read the contents of a local file. Only files under $HOME are accessible.", parameters:{ type:"object", properties:{ path:{ type:"string", description:"Absolute path to the file" }}, required:["path"] }}},
   { type:"function", function:{ name:"list_dir",    description:"List files and subdirectories in a local directory.", parameters:{ type:"object", properties:{ path:{ type:"string", description:"Absolute path to the directory" }}, required:["path"] }}},
-  { type:"function", function:{ name:"run_command", description:"Run a shell command and return its output. Use for pm2, git, npm, ls, curl, python3, node, etc.", parameters:{ type:"object", properties:{ command:{ type:"string", description:"Shell command to execute" }}, required:["command"] }}},
-  { type:"function", function:{ name:"write_file",      description:"Write text content to a file on the local filesystem. Creates parent directories automatically. Use to create source files, configs, scripts, etc.", parameters:{ type:"object", properties:{ path:{ type:"string", description:"Absolute path to write (must be under $HOME or /tmp)" }, content:{ type:"string", description:"Full text content to write to the file" }}, required:["path","content"] }}},
+  { type:"function", function:{ name:"run_command", description:"Run a shell command and return its output. Use for pm2, git, npm, ls, curl, python3, node, etc. Default timeout 30s — pass timeout_seconds (max 600) for long builds or test suites. For servers / watch tasks that never exit, use run_background instead.", parameters:{ type:"object", properties:{ command:{ type:"string", description:"Shell command to execute" }, timeout_seconds:{ type:"number", description:"Max seconds to wait (default 30, max 600)" }}, required:["command"] }}},
+  { type:"function", function:{ name:"run_background", description:"Start a LONG-RUNNING shell command in the background (dev server, watch task, long build) and return immediately with a process id. The command keeps running — use process_status(id) to read its output and process_kill(id) to stop it. Always kill servers you started when the task is done.", parameters:{ type:"object", properties:{ command:{ type:"string", description:"Shell command to run in the background" }}, required:["command"] }}},
+  { type:"function", function:{ name:"process_status", description:"Check a background process started with run_background: returns RUNNING or EXITED [exit N] plus its recent output. Call this after starting a server to confirm it came up.", parameters:{ type:"object", properties:{ id:{ type:"string", description:"Process id returned by run_background" }, tail_chars:{ type:"number", description:"How many characters of recent output to return (default 4000)" }}, required:["id"] }}},
+  { type:"function", function:{ name:"process_kill", description:"Stop a background process started with run_background.", parameters:{ type:"object", properties:{ id:{ type:"string", description:"Process id returned by run_background" }}, required:["id"] }}},
+  { type:"function", function:{ name:"process_list", description:"List all background processes (id, command, running/exited, elapsed seconds) as JSON.", parameters:{ type:"object", properties:{}, required:[] }}},
+  { type:"function", function:{ name:"write_file",      description:"Write text content to a NEW file (creates parent directories automatically). For changing an EXISTING file, prefer edit_file — it changes only the matched text instead of overwriting the whole file.", parameters:{ type:"object", properties:{ path:{ type:"string", description:"Absolute path to write (must be under $HOME or /tmp)" }, content:{ type:"string", description:"Full text content to write to the file" }}, required:["path","content"] }}},
+  { type:"function", function:{ name:"edit_file",       description:"Surgically edit an EXISTING file by exact search/replace — the safe way to modify files. old_string must match the file content exactly (read_file first to copy it, whitespace included) and must be unique in the file unless replace_all is true. Prefer this over write_file for any change to an existing file.", parameters:{ type:"object", properties:{ path:{ type:"string", description:"Absolute path of the file to edit (must exist, under $HOME or /tmp)" }, old_string:{ type:"string", description:"Exact text to find (must be unique in the file unless replace_all)" }, new_string:{ type:"string", description:"Replacement text" }, replace_all:{ type:"boolean", description:"Replace every occurrence instead of requiring a unique match (default false)" }}, required:["path","old_string","new_string"] }}},
   { type:"function", function:{ name:"search_files",    description:"Search file contents using a regex pattern across a directory tree (like grep -rn). Returns matching lines as 'file:line: content'. Use to find function definitions, variable usages, imports, TODO comments, or any text pattern across a codebase. Skips node_modules, .git, target, and binary files automatically.", parameters:{ type:"object", properties:{ dir:{ type:"string", description:"Absolute directory path to search under" }, pattern:{ type:"string", description:"Regex or literal string to search for" }, extensions:{ type:"string", description:"Optional comma-separated file extensions to restrict search, e.g. 'py,ts,js'. Searches all text files if omitted." }, max_results:{ type:"number", description:"Max matches to return (default 60, max 200)" }}, required:["dir","pattern"] }}},
+  { type:"function", function:{ name:"propose_plan",    description:"Present a structured plan to the user for approval BEFORE executing a complex task (2+ files, state-changing commands, architectural choices). The user sees the plan with Approve / Request-changes buttons; the result tells you their decision. Do not start executing until a plan is APPROVED. Skip planning for simple single-step tasks.", parameters:{ type:"object", properties:{ title:{ type:"string", description:"One-line summary of what the plan accomplishes" }, steps:{ type:"array", items:{ type:"string" }, description:"Numbered plan steps, each a concise action ('Create src/api.py with the fetch helper', 'Run pytest and confirm exit 0')" }}, required:["title","steps"] }}},
   { type:"function", function:{ name:"spawn_subagent",  description:"Spawn an isolated subagent to handle a subtask. coder role auto-runs a verifier after writing code, then a fixer if verification fails — you get a guaranteed-working result. researcher=web search only | coder=write+verify+fix (full pipeline) | verifier=run+inspect | fixer=fix broken code.", parameters:{ type:"object", properties:{ role:{ type:"string", enum:["researcher","coder","verifier","fixer"], description:"researcher=web search only | coder=write+verify+fix pipeline | verifier=run+inspect | fixer=fix broken code" }, task:{ type:"string", description:"Complete self-contained task description with all context the subagent needs — it has no access to this conversation" }}, required:["role","task"] }}},
+  { type:"function", function:{ name:"search_sessions", description:"Search the user's PAST CONVERSATION transcripts (auto-saved session exports). Use when asked about earlier discussions, prior decisions, 'what did we talk about', or to recall context from previous sessions. Returns matching lines as 'file:line: text' — the filenames start with the session date.", parameters:{ type:"object", properties:{ query:{ type:"string", description:"Keywords or phrase to find in past conversations" }, max_results:{ type:"number", description:"Max matching lines (default 40)" }}, required:["query"] }}},
   { type:"function", function:{ name:"search_knowledge", description:"Search your personal knowledge base — documents, notes, specs, and files you've added to ~/TonyAI-Documents/. Returns the most relevant passages. Use this to answer questions about your own projects, decisions, preferences, or any documents you've stored.", parameters:{ type:"object", properties:{ query:{ type:"string", description:"What to search for — natural language or keywords" }}, required:["query"] }}},
   { type:"function", function:{ name:"python_exec",      description:"Execute Python code in a SANDBOXED environment (~/TonyAI-Sandbox/) — safer than run_command for testing snippets, data analysis, or experimentation. Code runs in an isolated venv, not your project tree. Supports optional pip packages. Returns stdout, stderr, and exit code. Prefer this over run_command for any standalone Python code.", parameters:{ type:"object", properties:{ code:{ type:"string", description:"Python code to execute" }, packages:{ type:"string", description:"Optional comma-separated pip packages to install before running (e.g. 'requests,pandas')" }, timeout_seconds:{ type:"number", description:"Max execution time, default 60, max 300" }}, required:["code"] }}},
   { type:"function", function:{ name:"git_status",       description:"Get a git repo's current state: branch, ahead/behind, staged + unstaged + untracked files, stash count. Use BEFORE making changes to understand the current state.", parameters:{ type:"object", properties:{ repo_path:{ type:"string", description:"Absolute path to the git repository" }}, required:["repo_path"] }}},
@@ -1345,7 +1440,7 @@ const AGENT_TOOLS = [
   { type:"function", function:{ name:"git_blame",        description:"Show who last modified each line of a file. Useful for understanding the history and authors of specific code.", parameters:{ type:"object", properties:{ repo_path:{ type:"string", description:"Absolute path to the git repository" }, file:{ type:"string", description:"File path relative to the repo" }, line_start:{ type:"number", description:"Optional: starting line number" }, line_end:{ type:"number", description:"Optional: ending line number — required if line_start is set" }}, required:["repo_path","file"] }}},
 ];
 
-const TOOL_ICONS = { web_search:"🔍", deep_search:"🔎🌐", fetch_url:"🌐", read_file:"📄", write_file:"✍️", search_files:"🔎", list_dir:"📁", run_command:"⚡", spawn_subagent:"🤖", search_knowledge:"📚", python_exec:"🐍", git_status:"🌿", git_diff:"📝", git_log:"📜", git_blame:"👤", fixer:"🔧" };
+const TOOL_ICONS = { web_search:"🔍", deep_search:"🔎🌐", fetch_url:"🌐", read_file:"📄", write_file:"✍️", edit_file:"✂️", search_files:"🔎", list_dir:"📁", run_command:"⚡", run_background:"🔄", process_status:"📊", process_kill:"🛑", process_list:"📋", propose_plan:"🗒️", spawn_subagent:"🤖", search_knowledge:"📚", search_sessions:"🗂️", python_exec:"🐍", git_status:"🌿", git_diff:"📝", git_log:"📜", git_blame:"👤", fixer:"🔧" };
 
 // ── Context token estimation (chars ÷ 4 ≈ tokens) ────────────────────────────
 function estimateTokens(...textParts) {
@@ -1573,6 +1668,8 @@ export default function App() {
       if (prev.length === 1) return prev;
       const next = prev.filter(s => s.id !== id);
       persistSessions(next);
+      invoke("delete_session_file", { id: String(id) }).catch(() => {});
+      lastWrittenJson.delete(id);
       if (activeId === id) { setActiveId(next[next.length-1].id); persistActive(next[next.length-1].id); }
       return next;
     });
@@ -1598,7 +1695,17 @@ export default function App() {
   const [showModelSettings, setShowModelSettings] = useState(false);
 
   // UI state
-  const [loading, setLoading]         = useState(false);
+  // Per-session loading: sessions stream independently — one can generate while
+  // you read or send in another. `loading` reflects the ACTIVE session only.
+  const [loadingMap, setLoadingMap]   = useState({});   // sessionId → true while generating
+  const loading = !!loadingMap[activeId];
+  function setLoadingFor(sid, v) {
+    setLoadingMap(prev => {
+      const next = { ...prev };
+      if (v) next[sid] = true; else delete next[sid];
+      return next;
+    });
+  }
   const [input, setInput]             = useState("");
   const [ollamaOk, setOllamaOk]       = useState(null);
   const [backendStatus, setBknd]      = useState({ a1111:"checking", comfy:"checking" });
@@ -1632,10 +1739,41 @@ export default function App() {
   const [showAgentPanel, setAgentPanel] = useState(false);
   const [showInbox, setShowInbox]       = useState(false);
   const [inbox, setInbox]               = useState([]);
+  // Background processes started via run_background — [{id, command, status, exit_code, elapsed_s}]
+  const [bgProcs, setBgProcs]           = useState([]);
   const [compactNotice, setCompactNotice] = useState("");
   const [confirmCmds, setConfirmCmds] = useState(() => localStorage.getItem("tonyai-confirm-cmds") !== "false");
-  const [pendingCmd,  setPendingCmd]   = useState(null); // null | { name, detail } — awaiting user approval
+  const [pendingCmd,  setPendingCmd]   = useState(null); // null | { name, detail, diff, allowSuggestion } — awaiting user approval
   const pendingCmdRef = useRef(null);
+  // Self-update status line (shown after clicking "Rebuild & update")
+  const [updateStatus, setUpdateStatus] = useState("");
+  async function startSelfUpdate() {
+    setUpdateStatus("Starting…");
+    try {
+      setUpdateStatus(await invoke("launch_self_update", { sourceDir: `${homeDir}/tonyai` }));
+    } catch(e) {
+      setUpdateStatus(`⚠ ${e}`);
+    }
+  }
+
+  // Per-model agent stats (aggregated from ~/.tonyai/telemetry.jsonl)
+  const [telemetryStats, setTelemetryStats] = useState([]);
+  useEffect(() => {
+    if (!showAgentPanel) return;
+    invoke("read_telemetry")
+      .then(raw => setTelemetryStats(aggregateTelemetry(raw)))
+      .catch(() => {});
+  }, [showAgentPanel]);
+
+  // Pending plan approval — null | { title, steps } (promise handles in ref)
+  const [pendingPlan, setPendingPlan] = useState(null);
+  const pendingPlanRef = useRef(null);
+  const [planFeedback, setPlanFeedback] = useState("");
+  // Persistent "always allow" patterns — [{ tool, pattern }]
+  const [approvalAllowlist, setApprovalAllowlist] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("tonyai-approval-allowlist") || "[]"); } catch { return []; }
+  });
+  useEffect(() => { localStorage.setItem("tonyai-approval-allowlist", JSON.stringify(approvalAllowlist)); }, [approvalAllowlist]);
   const [homeDir, setHomeDir] = useState("/Users/tonyjagodka"); // populated from Rust at bootstrap
   // MCP server configurations (persisted to localStorage)
   const [mcpServers, setMcpServers] = useState(() => {
@@ -1731,7 +1869,8 @@ export default function App() {
 
   const bottomRef   = useRef(null);
   const textareaRef = useRef(null);
-  const abortRef    = useRef(null);
+  // Per-session stream handles: sessionId → { ctrl: AbortController, eventId: string|null }
+  const streamRef   = useRef({});
   // Stable ref so keyboard handler always sees latest functions without re-registering
   const shortcutRef    = useRef({});
   // Maps sessionId → message count at last save — prevents duplicate exports
@@ -1795,10 +1934,13 @@ export default function App() {
         : String(srv.args||"").split(/\s+/).filter(Boolean);
       const envObj = typeof srv.env === "object" ? srv.env : {};
       const toolsJson = await invoke("mcp_initialize", {
-        id:      srv.id,
-        command: srv.command,
-        args:    argsArray,
-        envVars: Object.keys(envObj).length > 0 ? envObj : null,
+        id:        srv.id,
+        transport: srv.transport === "http" ? "http" : "stdio",
+        url:       srv.url || null,
+        authToken: srv.authToken || null,
+        command:   srv.command || null,
+        args:      argsArray,
+        envVars:   Object.keys(envObj).length > 0 ? envObj : null,
       });
       const tools = JSON.parse(toolsJson);
       setMcpDiscoveredTools(prev => ({ ...prev, [srv.id]: tools }));
@@ -2190,8 +2332,31 @@ export default function App() {
     // Fetch home directory from Rust (avoids hardcoded usernames)
     try { const h = await invoke("get_home_dir"); if (h) setHomeDir(h); } catch {}
 
+    // Hydrate sessions from the disk store (migrating any legacy localStorage copy)
+    try {
+      let diskSessions = JSON.parse(await invoke("read_sessions"));
+      if (!diskSessions.length) {
+        const legacy = loadSessions();
+        if (legacy?.length) {
+          diskSessions = legacy;
+          persistSessions(legacy); // one-time migration to disk
+        }
+      }
+      if (diskSessions.length) {
+        const NON_AUTO = new Set(["chat","code","python","sui","arb","agent"]);
+        const migrated = diskSessions.map(s => NON_AUTO.has(s.mode) ? { ...s, mode:"auto" } : s);
+        setSessions(migrated);
+        const aid = loadActiveId();
+        const target = migrated.find(x => x.id === aid) ? aid : migrated[migrated.length-1].id;
+        setActiveId(target);
+        persistActive(target);
+      }
+      localStorage.removeItem(SESSION_KEY); // sessions live on disk now — free the quota
+    } catch (e) { console.warn("[TonyAI] session hydration failed:", e); }
+
     // Start any enabled MCP servers
-    const enabledServers = mcpServers.filter(s => s.enabled && s.command?.trim());
+    const enabledServers = mcpServers.filter(s =>
+      s.enabled && (s.transport === "http" ? s.url?.trim() : s.command?.trim()));
     for (const srv of enabledServers) {
       initMcpServer(srv); // fire-and-forget; errors update server status
     }
@@ -2373,21 +2538,52 @@ export default function App() {
   }
 
   function stopGeneration() {
-    invoke("ollama_abort");        // stops Ollama streaming (Rust side)
-    abortRef.current?.abort();    // stops in-flight image gen fetch (A1111/ComfyUI)
-    setLoading(false);
+    // Abort only the ACTIVE session's stream — other sessions keep generating.
+    const entry = streamRef.current[activeId];
+    if (entry?.eventId) invoke("ollama_abort", { eventId: entry.eventId });
+    entry?.ctrl?.abort();          // stops agent loop / in-flight image gen fetch
+    setLoadingFor(activeId, false);
   }
 
   // Permission gate helpers — used by agent loop before any state-changing tool
   // (run_command, write_file, python_exec, MCP). Resolves on Allow, rejects on Deny.
-  function requestToolPermission(name, detail) {
+  function requestToolPermission(name, detail, diff, allowSuggestion) {
     return new Promise((resolve, reject) => {
       pendingCmdRef.current = { resolve, reject };
-      setPendingCmd({ name, detail: detail || "" });
+      setPendingCmd({ name, detail: detail || "", diff: diff?.length ? diff : null, allowSuggestion: allowSuggestion || null });
     });
   }
+  // Plan approval gate — resolves { approved, feedback } when the user decides
+  function requestPlanApproval(plan) {
+    return new Promise((resolve) => {
+      pendingPlanRef.current = { resolve };
+      setPlanFeedback("");
+      setPendingPlan(plan);
+    });
+  }
+  function approvePlan() {
+    pendingPlanRef.current?.resolve({ approved: true });
+    setPendingPlan(null);
+  }
+  function rejectPlan() {
+    pendingPlanRef.current?.resolve({ approved: false, feedback: planFeedback.trim() });
+    setPendingPlan(null);
+  }
+
   function allowCmd() { pendingCmdRef.current?.resolve(); setPendingCmd(null); }
   function denyCmd()  { pendingCmdRef.current?.reject(new Error("denied")); setPendingCmd(null); }
+  // Allow + remember: store the suggested pattern so future matching calls skip the prompt
+  function allowCmdAlways() {
+    const sug = pendingCmd?.allowSuggestion;
+    if (sug) {
+      setApprovalAllowlist(prev =>
+        prev.some(e => e.tool === sug.tool && e.pattern === sug.pattern)
+          ? prev
+          : [...prev, { tool: sug.tool, pattern: sug.pattern }]
+      );
+    }
+    allowCmd();
+  }
 
   function clearConversation() {
     if (messages.length === 0) return;
@@ -2432,6 +2628,36 @@ export default function App() {
     }
   }
 
+  // ── Checkpoint revert handler ─────────────────────────────────────────────
+  async function revertCheckpoint(msgIdx) {
+    const msg = messages[msgIdx];
+    const id = msg?.checkpoint?.id;
+    if (!id || msg.reverted) return;
+    try {
+      const res = await invoke("checkpoint_revert", { turnId: id });
+      setMessages(prev => prev.map((m, j) => j === msgIdx ? { ...m, reverted: String(res) } : m));
+    } catch(e) {
+      setMessages(prev => prev.map((m, j) => j === msgIdx ? { ...m, reverted: `Revert failed: ${e}` } : m));
+    }
+  }
+
+  // ── Background process handlers ───────────────────────────────────────────
+  async function refreshBgProcs() {
+    try { setBgProcs(JSON.parse(await invoke("tool_process_list"))); } catch {}
+  }
+  async function killBgProc(id) {
+    try { await invoke("tool_process_kill", { id }); } catch {}
+    refreshBgProcs();
+  }
+
+  // While any background process exists, poll its status every 10s so the
+  // strip stays current and exited processes update without a manual check.
+  useEffect(() => {
+    if (bgProcs.length === 0) return;
+    const t = setInterval(refreshBgProcs, 10_000);
+    return () => clearInterval(t);
+  }, [bgProcs.length]);
+
   // ── Inbox handlers ────────────────────────────────────────────────────────
   async function markInboxRead(id) {
     const updated = inbox.map(f => f.id === id ? { ...f, read: true } : f);
@@ -2455,9 +2681,12 @@ export default function App() {
   async function send(promptOverride, historyOverride) {
     const prompt = promptOverride !== undefined ? promptOverride : input.trim();
     if (!prompt && !attachments.length) return;
-    if (loading) return;
+    if (loading) return; // active session already generating (other sessions may stream concurrently)
     if (promptOverride === undefined) setInput("");
-    setLoading(true);
+    // Capture the originating session — all loading/abort state for this turn is
+    // keyed to it, so streams keep flowing correctly if the user switches sessions.
+    const sessId = activeId;
+    setLoadingFor(sessId, true);
 
     // Auto-routing: classify the prompt, pick the best mode's behavior
     const effectiveMode = mode === "auto" ? classifyPrompt(prompt) : mode;
@@ -2475,7 +2704,7 @@ export default function App() {
       ]);
       const [w,h] = imgSettings.size.split("×").map(Number);
       const imgCtrl = new AbortController();
-      abortRef.current = imgCtrl;
+      streamRef.current[sessId] = { ctrl: imgCtrl, eventId: null };
       try {
         let imageUrl;
         if (imgSettings.backend==="a1111") {
@@ -2503,8 +2732,8 @@ export default function App() {
           setMessages(prev=>prev.map(m=>m.id===id?{...m,generating:false,error:"Cancelled"}:m));
         }
       }
-      abortRef.current = null;
-      setLoading(false);
+      delete streamRef.current[sessId];
+      setLoadingFor(sessId, false);
       return;
     }
 
@@ -2530,7 +2759,7 @@ export default function App() {
     if (baseHistory.length === 0) autoTitle(prompt);
 
     const ctrl = new AbortController();
-    abortRef.current = ctrl;
+    streamRef.current[sessId] = { ctrl, eventId: null };
 
     try {
       // Build memory injection (text notes + any saved text-file attachments)
@@ -2586,6 +2815,10 @@ ${hasSubagent ? `- spawn_subagent(role, task): Isolated subagent — researcher 
 VERIFY RULE — mandatory for coding tasks:
 After writing code, run it. Check [exit N] — [exit 0] = pass. Non-zero = fix and re-run.
 Never write TASK_COMPLETE until you have [exit 0].
+
+PLAN RULE: For tasks touching 2+ files or changing system state, call propose_plan
+first and wait for the user's APPROVED result before executing. Skip for simple
+single-file or read-only tasks.
 
 Always complete the task fully. When done, end with TASK_COMPLETE on its own line.
 
@@ -2700,6 +2933,24 @@ MEMORY: If you learn a user preference, project constraint, correction, or recur
         // Tracks every completed tool step this session — used by the stop condition evaluator
         const loopToolSteps = [];
 
+        // Checkpoint for this turn — every file write_file/edit_file touches
+        // (including inside subagents) is snapshotted under this id so the
+        // whole turn can be reverted with one click.
+        const checkpointId = `ckpt_${Date.now()}`;
+        const turnCheckpoint = { id: checkpointId, mutatedPaths: new Set() };
+
+        // Per-project instructions: track which TONYAI.md files we've already
+        // injected this turn, and which directories we've already probed.
+        const injectedInstructionFiles = new Set();
+        const probedInstructionDirs    = new Set();
+
+        // Telemetry for this agent run — written as one JSONL line in finally.
+        const telemetry = {
+          model: activeModel, mode: effectiveMode,
+          loops: 0, toolCalls: 0, toolErrors: 0, stopRejections: 0,
+          outcome: "answered", startedAt: Date.now(),
+        };
+
         // Prompt-injection provenance: flips true once untrusted web content (fetch_url /
         // deep_search) enters context this turn. While true, any state-changing tool must
         // be human-approved even if confirmCmds is off. Resets each send().
@@ -2726,6 +2977,7 @@ After getting results, give your final answer in normal markdown. Never include 
 
           while (loopCount < MAX_LOOPS) {
             loopCount++;
+            telemetry.loops = loopCount;
             if (ctrl.signal.aborted) break;
 
             // Build messages — in prompt mode, override system with tool instructions appended
@@ -2742,6 +2994,7 @@ After getting results, give your final answer in normal markdown. Never include 
             };
 
             const eventId = (Date.now() + loopCount).toString();
+            if (streamRef.current[sessId]) streamRef.current[sessId].eventId = eventId;
             let streamText = "";
             let toolCalls = null;
             let rafId = null;
@@ -2840,6 +3093,7 @@ After getting results, give your final answer in normal markdown. Never include 
                 }
                 if (!stopCheck.canStop) {
                   // Reject premature completion — inject correction and keep looping
+                  telemetry.stopRejections++;
                   const correction = `[STOP CONDITION NOT MET] ${stopCheck.reason}`;
                   ollamaMsgs.push({ role:"assistant", content: streamText });
                   ollamaMsgs.push({ role:"user",      content: correction });
@@ -2857,6 +3111,7 @@ After getting results, give your final answer in normal markdown. Never include 
                   // Don't break — continue the loop
                 } else {
                   // Evaluator passed — accept completion
+                  telemetry.outcome = "complete";
                   const clean = streamText.replace(/\n?TASK_COMPLETE\s*$/m, "").trimEnd();
                   setMessages(prev => {
                     const u = [...prev];
@@ -2928,10 +3183,16 @@ After getting results, give your final answer in normal markdown. Never include 
               // Required when confirmCmds is on, OR (regardless of that setting) once
               // untrusted web content has entered context this turn — the prompt-injection
               // guardrail: a human must sign off before web-influenced side effects run.
-              else if ((confirmCmds || sawWebContent) && isMutatingTool(fnName)) {
+              // Allowlisted calls skip the prompt — but never while untrusted web
+              // content is in context (the injection guardrail outranks the allowlist).
+              else if ((confirmCmds || sawWebContent) && isMutatingTool(fnName)
+                       && (sawWebContent || !isAllowlisted(approvalAllowlist, fnName, fnArgs))) {
                 const detail = (sawWebContent ? "⚠ web content in context — " : "") + toolApprovalDetail(fnName, fnArgs);
                 try {
-                  await requestToolPermission(fnName, detail);
+                  await requestToolPermission(
+                    fnName, detail, approvalDiffFor(fnName, fnArgs),
+                    sawWebContent ? null : suggestAllowPattern(fnName, fnArgs),
+                  );
                 } catch {
                   toolBlocked = true;
                   toolResult = "⛔ Blocked by user";
@@ -2940,7 +3201,7 @@ After getting results, give your final answer in normal markdown. Never include 
 
               if (!toolBlocked) {
                 // Pre-flight: validate required args (skip for MCP namespaced + native subagent/knowledge)
-                const isNamespacedOrCustom = fnName.startsWith("mcp__") || fnName === "spawn_subagent" || fnName === "search_knowledge";
+                const isNamespacedOrCustom = fnName.startsWith("mcp__") || fnName === "spawn_subagent" || fnName === "search_knowledge" || fnName === "search_sessions";
                 const argCheck = isNamespacedOrCustom ? { valid: true } : validateToolArgs(fnName, fnArgs, modeToolSet);
                 if (!argCheck.valid) {
                   toolResult = `Error: ${argCheck.error}`;
@@ -3012,14 +3273,25 @@ After getting results, give your final answer in normal markdown. Never include 
                   else if (fnName === "read_file")    toolResult = await invoke("tool_read_file",    { path: fnArgs.path });
                   else if (fnName === "list_dir")     toolResult = await invoke("tool_list_dir",     { path: fnArgs.path });
                   else if (fnName === "search_files") toolResult = await invoke("tool_search_files", { dir: fnArgs.dir, pattern: fnArgs.pattern, extensions: fnArgs.extensions ?? null, maxResults: fnArgs.max_results ?? null });
-                  else if (fnName === "run_command")  toolResult = await invoke("tool_run_command",  { command: fnArgs.command });
+                  else if (fnName === "run_command")  toolResult = await invoke("tool_run_command",  { command: fnArgs.command, timeoutSeconds: fnArgs.timeout_seconds ?? null });
+                  else if (fnName === "run_background") { toolResult = await invoke("tool_run_background", { command: fnArgs.command }); refreshBgProcs(); }
+                  else if (fnName === "process_status") { toolResult = await invoke("tool_process_status", { id: fnArgs.id, tailChars: fnArgs.tail_chars ?? null }); refreshBgProcs(); }
+                  else if (fnName === "process_kill")   { toolResult = await invoke("tool_process_kill",   { id: fnArgs.id }); refreshBgProcs(); }
+                  else if (fnName === "process_list")   { toolResult = await invoke("tool_process_list");   refreshBgProcs(); }
                   else if (fnName === "python_exec")  toolResult = await invoke("tool_python_exec", { code: fnArgs.code, packages: fnArgs.packages ?? null, timeoutSeconds: fnArgs.timeout_seconds ?? null });
                   else if (fnName === "git_status")   toolResult = await invoke("tool_git_status",  { repoPath: fnArgs.repo_path });
                   else if (fnName === "git_diff")     toolResult = await invoke("tool_git_diff",    { repoPath: fnArgs.repo_path, staged: fnArgs.staged ?? null, file: fnArgs.file ?? null });
                   else if (fnName === "git_log")      toolResult = await invoke("tool_git_log",     { repoPath: fnArgs.repo_path, maxCount: fnArgs.max_count ?? null, file: fnArgs.file ?? null });
                   else if (fnName === "git_blame")    toolResult = await invoke("tool_git_blame",   { repoPath: fnArgs.repo_path, file: fnArgs.file, lineStart: fnArgs.line_start ?? null, lineEnd: fnArgs.line_end ?? null });
-                  else if (fnName === "write_file") {
-                    toolResult = await invoke("tool_write_file", { path: fnArgs.path, content: fnArgs.content });
+                  else if (fnName === "write_file" || fnName === "edit_file") {
+                    // Snapshot the pre-mutation state so this turn can be reverted
+                    try {
+                      await invoke("checkpoint_file", { turnId: checkpointId, path: fnArgs.path });
+                      turnCheckpoint.mutatedPaths.add(fnArgs.path);
+                    } catch {}
+                    toolResult = fnName === "write_file"
+                      ? await invoke("tool_write_file", { path: fnArgs.path, content: fnArgs.content })
+                      : await invoke("tool_edit_file",  { path: fnArgs.path, oldString: fnArgs.old_string, newString: fnArgs.new_string, replaceAll: fnArgs.replace_all ?? null });
                     // Verify nudge — appended for runnable code files so the model is
                     // forced to run and check [exit 0] before declaring completion.
                     const codeExts = new Set([".py",".js",".ts",".jsx",".tsx",".sh",".rb",".go",".rs",".java",".c",".cpp",".swift",".kt",".mjs",".cjs"]);
@@ -3066,6 +3338,7 @@ After getting results, give your final answer in normal markdown. Never include 
                         model: activeModel,
                         signal: ctrl.signal,
                         braveApiKey,
+                        checkpoint: turnCheckpoint,
                         onStageUpdate: (stages, allSteps) => {
                           setMessages(prev => {
                             const u = [...prev];
@@ -3084,7 +3357,7 @@ After getting results, give your final answer in normal markdown. Never include 
                       // Regular single-stage subagent (researcher / verifier / fixer direct)
                       const subResult = await runSubagent({
                         role: subRole, task: subTask, model: activeModel,
-                        signal: ctrl.signal, braveApiKey,
+                        signal: ctrl.signal, braveApiKey, checkpoint: turnCheckpoint,
                         onProgress: (subSteps) => {
                           setMessages(prev => {
                             const u = [...prev];
@@ -3115,6 +3388,36 @@ After getting results, give your final answer in normal markdown. Never include 
                       u[u.length-1] = { ...last, toolSteps: updSteps };
                       return u;
                     });
+                  }
+                  else if (fnName === "propose_plan") {
+                    const planSteps = Array.isArray(fnArgs.steps)
+                      ? fnArgs.steps.map(String)
+                      : String(fnArgs.steps || "").split("\n").map(s => s.trim()).filter(Boolean);
+                    if (planSteps.length === 0) {
+                      toolResult = "Error: plan has no steps. Call propose_plan with a steps array.";
+                    } else {
+                      const decision = await requestPlanApproval({ title: String(fnArgs.title || "Plan"), steps: planSteps });
+                      toolResult = decision.approved
+                        ? "✅ Plan APPROVED by the user. Execute it now, starting with step 1. Do not re-plan or ask again."
+                        : `❌ Plan NOT approved.${decision.feedback ? ` User feedback: ${decision.feedback}` : ""}\nRevise the plan based on the feedback and call propose_plan again with the updated steps.`;
+                    }
+                  }
+                  else if (fnName === "search_sessions") {
+                    // Keyword search over exported transcripts — escape regex
+                    // metacharacters so natural phrases match literally.
+                    const escaped = String(fnArgs.query || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                    try {
+                      toolResult = await invoke("tool_search_files", {
+                        dir: `${homeDir}/TonyAI-Exports`,
+                        pattern: escaped,
+                        extensions: "md",
+                        maxResults: fnArgs.max_results ?? 40,
+                      });
+                    } catch (e) {
+                      toolResult = String(e).includes("not found")
+                        ? "No past session transcripts yet — exports appear in ~/TonyAI-Exports as conversations complete."
+                        : enrichToolError("search_sessions", e);
+                    }
                   }
                   else if (fnName === "search_knowledge") {
                     if (knowledgeIndex && (knowledgeStatus === "ready" || knowledgeStatus === "stale")) {
@@ -3153,6 +3456,9 @@ After getting results, give your final answer in normal markdown. Never include 
                 return u;
               });
 
+              telemetry.toolCalls++;
+              if (isToolErr || toolBlocked) telemetry.toolErrors++;
+
               // Record step for stop-condition evaluation
               loopToolSteps.push({
                 name:     fnName,
@@ -3174,6 +3480,31 @@ After getting results, give your final answer in normal markdown. Never include 
                 ollamaMsgs.push({ role:"user", content: `[Tool result: ${fnName}]\n${String(toolResult)}` });
               } else {
                 ollamaMsgs.push({ role:"tool", content: String(toolResult), name: fnName, tool_call_id: tcId });
+              }
+
+              // Per-project instructions: when a tool touched a path inside a
+              // project tree containing a TONYAI.md, inject it once so the model
+              // follows that project's conventions for the rest of the turn.
+              const pathArg = fnArgs.path || fnArgs.dir || fnArgs.repo_path;
+              if (typeof pathArg === "string" && pathArg.startsWith("/")) {
+                const probeDir = pathArg.slice(0, pathArg.lastIndexOf("/")) || pathArg;
+                if (!probedInstructionDirs.has(probeDir)) {
+                  probedInstructionDirs.add(probeDir);
+                  try {
+                    const raw = await invoke("find_project_instructions", { path: pathArg });
+                    if (raw && raw !== "null") {
+                      const info = JSON.parse(raw);
+                      if (info?.path && info?.content?.trim() && !injectedInstructionFiles.has(info.path)) {
+                        injectedInstructionFiles.add(info.path);
+                        ollamaMsgs.push({
+                          role: "user",
+                          content: `[PROJECT INSTRUCTIONS — ${info.path}]\nStanding instructions for this project. Follow them for all work inside this directory tree.\n\n${info.content}\n[END PROJECT INSTRUCTIONS]`,
+                        });
+                        setCompactNotice(`📋 Loaded project instructions: ${info.path.replace(homeDir, "~")}`);
+                      }
+                    }
+                  } catch {}
+                }
               }
             }
 
@@ -3247,14 +3578,33 @@ After getting results, give your final answer in normal markdown. Never include 
             });
           } // end while
         } catch(agentErr) {
+          telemetry.outcome = "error";
           setMessages(prev => {
             const u = [...prev];
             u[u.length-1] = { ...u[u.length-1], content: `⚠️ ${agentErr.message}`, error: true };
             return u;
           });
         } finally {
-          setLoading(false);
-          abortRef.current = null;
+          // One telemetry line per agent run — powers the per-model stats table
+          if (ctrl.signal.aborted && telemetry.outcome === "answered") telemetry.outcome = "aborted";
+          const { startedAt, ...rest } = telemetry;
+          invoke("append_telemetry", {
+            line: JSON.stringify({ ts: new Date().toISOString(), ...rest, durationS: Math.round((Date.now() - startedAt) / 1000) }),
+          }).catch(() => {});
+          // Attach revert info when this turn changed files (even on abort/error —
+          // a half-finished turn is exactly when you want to rewind).
+          if (turnCheckpoint.mutatedPaths.size > 0) {
+            setMessages(prev => {
+              const u = [...prev];
+              const last = u[u.length-1];
+              if (last?.type === "tool_step") {
+                u[u.length-1] = { ...last, checkpoint: { id: checkpointId, files: [...turnCheckpoint.mutatedPaths] } };
+              }
+              return u;
+            });
+          }
+          setLoadingFor(sessId, false);
+          delete streamRef.current[sessId];
         }
         return; // exit send() — agent path handled
       }
@@ -3272,6 +3622,7 @@ After getting results, give your final answer in normal markdown. Never include 
       console.log("[TonyAI] sending to Ollama, model:", activeModel, smartRoute && activeModel !== model ? `(smart-routed from ${model})` : "", "msgs:", reqBody.messages.length);
 
       const eventId = Date.now().toString();
+      if (streamRef.current[sessId]) streamRef.current[sessId].eventId = eventId;
       let streamText = "";
       let rafId = null; // rAF handle — limits React re-renders to ~60fps
       setMessages(prev=>[...prev,{ role:"assistant", content:"", ...(mode==="auto" ? { routedMode: effectiveMode } : {}) }]);
@@ -3319,13 +3670,13 @@ After getting results, give your final answer in normal markdown. Never include 
           });
         }
         unlisten();
-        setLoading(false);
-        abortRef.current = null;
+        setLoadingFor(sessId, false);
+        delete streamRef.current[sessId];
       }
     } catch(err) {
       setMessages(prev=>[...prev,{role:"assistant",content:`⚠️ ${err.message}`,error:true}]);
-      setLoading(false);
-      abortRef.current = null;
+      setLoadingFor(sessId, false);
+      delete streamRef.current[sessId];
     }
   }
 
@@ -3413,7 +3764,12 @@ After getting results, give your final answer in normal markdown. Never include 
                       </div>
                     )}
                     <div className={`sitem${isActive?" active":""}`} onClick={()=>{ if(editingSessionId!==sess.id) switchSession(sess.id); }}>
-                      <div style={{ width:5, height:5, borderRadius:"50%", flexShrink:0, background: isActive ? (isDark?"rgba(180,160,255,0.65)":"rgba(255,255,255,0.55)") : (isDark?"rgba(160,130,255,0.22)":"rgba(100,70,180,0.3)") }}/>
+                      <div style={{ width:5, height:5, borderRadius:"50%", flexShrink:0,
+                        background: loadingMap[sess.id] ? "#38bdf8"
+                          : isActive ? (isDark?"rgba(180,160,255,0.65)":"rgba(255,255,255,0.55)")
+                          : (isDark?"rgba(160,130,255,0.22)":"rgba(100,70,180,0.3)"),
+                        animation: loadingMap[sess.id] ? "pulse 1.2s ease-in-out infinite" : "none" }}
+                        title={loadingMap[sess.id] ? "Generating…" : ""}/>
                       {editingSessionId === sess.id
                         ? <input autoFocus value={editingTitle}
                             onChange={e=>setEditingTitle(e.target.value)}
@@ -3651,6 +4007,64 @@ After getting results, give your final answer in normal markdown. Never include 
               <div style={{ marginTop:4, fontSize:10, color:"var(--tny-tx5)", lineHeight:1.5 }}>
                 read_file, list_dir, web_search, fetch_url auto-execute silently — read-only and safe
               </div>
+              {/* Self-update from source */}
+              <div style={{ marginTop:10, paddingTop:8, borderTop:"1px solid var(--tny-line)", display:"flex", alignItems:"center", gap:10, flexWrap:"wrap" }}>
+                <button onClick={startSelfUpdate}
+                  style={{ background:"none", border:"1px solid var(--tny-line2)", color:"var(--tny-tx3)", cursor:"pointer", borderRadius:6, padding:"4px 12px", fontSize:11, fontFamily:"inherit" }}>
+                  ⬆ Rebuild & update app from source
+                </button>
+                {updateStatus && <span style={{ fontSize:10, color:"var(--tny-tx4)", fontFamily:"'JetBrains Mono',monospace", flex:1, minWidth:200 }}>{updateStatus}</span>}
+              </div>
+              {/* Agent telemetry — which models actually finish agentic work */}
+              {telemetryStats.length > 0 && (
+                <div style={{ marginTop:10, paddingTop:8, borderTop:"1px solid var(--tny-line)" }}>
+                  <div style={{ fontSize:10, color:"var(--tny-tx5)", letterSpacing:"0.08em", textTransform:"uppercase", marginBottom:6 }}>📈 Agent stats (per model)</div>
+                  <table style={{ borderCollapse:"collapse", fontSize:10.5, fontFamily:"'JetBrains Mono',monospace", color:"var(--tny-tx3)" }}>
+                    <thead>
+                      <tr style={{ color:"var(--tny-tx5)", textAlign:"left" }}>
+                        <th style={{ padding:"2px 14px 2px 0", fontWeight:500 }}>model</th>
+                        <th style={{ padding:"2px 14px 2px 0", fontWeight:500 }}>runs</th>
+                        <th style={{ padding:"2px 14px 2px 0", fontWeight:500 }}>completed</th>
+                        <th style={{ padding:"2px 14px 2px 0", fontWeight:500 }}>errors</th>
+                        <th style={{ padding:"2px 14px 2px 0", fontWeight:500 }}>avg loops</th>
+                        <th style={{ padding:"2px 14px 2px 0", fontWeight:500 }}>stop-rejects</th>
+                        <th style={{ padding:"2px 0", fontWeight:500 }}>avg time</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {telemetryStats.map(s => (
+                        <tr key={s.model}>
+                          <td style={{ padding:"2px 14px 2px 0", maxWidth:160, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{s.model.split(":")[0]}</td>
+                          <td style={{ padding:"2px 14px 2px 0" }}>{s.runs}</td>
+                          <td style={{ padding:"2px 14px 2px 0", color: s.completionRate >= 70 ? "#22c55e" : s.completionRate >= 40 ? "#eab308" : "#ef4444" }}>{s.completionRate}%</td>
+                          <td style={{ padding:"2px 14px 2px 0" }}>{s.errorRate}%</td>
+                          <td style={{ padding:"2px 14px 2px 0" }}>{s.avgLoops}</td>
+                          <td style={{ padding:"2px 14px 2px 0" }}>{s.avgStopRejections}</td>
+                          <td style={{ padding:"2px 0" }}>{s.avgDurationS}s</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              {/* Always-allow list */}
+              {approvalAllowlist.length > 0 && (
+                <div style={{ marginTop:8 }}>
+                  <div style={{ fontSize:10, color:"var(--tny-tx5)", marginBottom:4 }}>
+                    Always allowed (no prompt — except when web content is in context):
+                  </div>
+                  <div style={{ display:"flex", flexWrap:"wrap", gap:5 }}>
+                    {approvalAllowlist.map((e, i) => (
+                      <div key={i} style={{ display:"flex", alignItems:"center", gap:5, background:"var(--tny-code)", border:"1px solid var(--tny-line2)", borderRadius:6, padding:"2px 7px", fontSize:10, color:"var(--tny-tx3)", fontFamily:"'JetBrains Mono',monospace" }}>
+                        <span style={{ color:"var(--tny-tx5)" }}>{e.tool}:</span>
+                        <span style={{ maxWidth:220, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{e.pattern}</span>
+                        <button onClick={()=>setApprovalAllowlist(prev=>prev.filter((_,j)=>j!==i))}
+                          style={{ background:"none", border:"none", color:"var(--tny-tx4)", cursor:"pointer", fontSize:11, padding:0, lineHeight:1 }}>✕</button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -3694,12 +4108,35 @@ After getting results, give your final answer in normal markdown. Never include 
                   <button onClick={async()=>{ await stopMcpServer(srv.id); setMcpServers(p=>p.filter((_,i)=>i!==idx)); }}
                     style={{ background:"none", border:"none", color:"var(--tny-tx5)", cursor:"pointer", fontSize:14, lineHeight:1, padding:"0 2px" }}>✕</button>
                 </div>
-                {/* Row 2: command + args */}
-                <div style={{ display:"flex", gap:6 }}>
-                  <input value={srv.command} placeholder="command (e.g. npx)" onChange={e=>setMcpServers(p=>p.map((s,i)=>i===idx?{...s,command:e.target.value}:s))}
-                    style={{ width:100, background:"var(--tny-code)", border:"1px solid var(--tny-line)", color:"var(--tny-tx3)", borderRadius:5, padding:"4px 7px", fontSize:11, fontFamily:"'JetBrains Mono',monospace", outline:"none" }}/>
-                  <input value={Array.isArray(srv.args)?srv.args.join(" "):srv.args} placeholder="args (space-separated)" onChange={e=>setMcpServers(p=>p.map((s,i)=>i===idx?{...s,args:e.target.value}:s))}
-                    style={{ flex:1, background:"var(--tny-code)", border:"1px solid var(--tny-line)", color:"var(--tny-tx3)", borderRadius:5, padding:"4px 7px", fontSize:11, fontFamily:"'JetBrains Mono',monospace", outline:"none" }}/>
+                {/* Row 2: transport + connection details */}
+                <div style={{ display:"flex", gap:6, alignItems:"center" }}>
+                  <div style={{ display:"flex", gap:0, flexShrink:0 }}>
+                    {["stdio","http"].map(t => (
+                      <button key={t} onClick={()=>setMcpServers(p=>p.map((s,i)=>i===idx?{...s,transport:t}:s))}
+                        style={{ padding:"3px 8px", fontSize:10, fontFamily:"'JetBrains Mono',monospace", cursor:"pointer",
+                          background:(srv.transport||"stdio")===t?"var(--tny-accent-lo)":"transparent",
+                          border:`1px solid ${(srv.transport||"stdio")===t?accent+"66":"var(--tny-line2)"}`,
+                          color:(srv.transport||"stdio")===t?accent:"var(--tny-tx5)",
+                          borderRadius:t==="stdio"?"5px 0 0 5px":"0 5px 5px 0" }}>
+                        {t}
+                      </button>
+                    ))}
+                  </div>
+                  {(srv.transport||"stdio") === "stdio" ? (
+                    <>
+                      <input value={srv.command||""} placeholder="command (e.g. npx)" onChange={e=>setMcpServers(p=>p.map((s,i)=>i===idx?{...s,command:e.target.value}:s))}
+                        style={{ width:100, background:"var(--tny-code)", border:"1px solid var(--tny-line)", color:"var(--tny-tx3)", borderRadius:5, padding:"4px 7px", fontSize:11, fontFamily:"'JetBrains Mono',monospace", outline:"none" }}/>
+                      <input value={Array.isArray(srv.args)?srv.args.join(" "):srv.args||""} placeholder="args (space-separated)" onChange={e=>setMcpServers(p=>p.map((s,i)=>i===idx?{...s,args:e.target.value}:s))}
+                        style={{ flex:1, background:"var(--tny-code)", border:"1px solid var(--tny-line)", color:"var(--tny-tx3)", borderRadius:5, padding:"4px 7px", fontSize:11, fontFamily:"'JetBrains Mono',monospace", outline:"none" }}/>
+                    </>
+                  ) : (
+                    <>
+                      <input value={srv.url||""} placeholder="https://server.example.com/mcp" onChange={e=>setMcpServers(p=>p.map((s,i)=>i===idx?{...s,url:e.target.value}:s))}
+                        style={{ flex:1, background:"var(--tny-code)", border:"1px solid var(--tny-line)", color:"var(--tny-tx3)", borderRadius:5, padding:"4px 7px", fontSize:11, fontFamily:"'JetBrains Mono',monospace", outline:"none" }}/>
+                      <input type="password" value={srv.authToken||""} placeholder="bearer token (optional)" onChange={e=>setMcpServers(p=>p.map((s,i)=>i===idx?{...s,authToken:e.target.value}:s))}
+                        style={{ width:150, background:"var(--tny-code)", border:"1px solid var(--tny-line)", color:"var(--tny-tx3)", borderRadius:5, padding:"4px 7px", fontSize:11, fontFamily:"'JetBrains Mono',monospace", outline:"none" }}/>
+                    </>
+                  )}
                 </div>
                 {/* Error detail */}
                 {srv.status==="error"&&srv.error&&(
@@ -3952,6 +4389,24 @@ After getting results, give your final answer in normal markdown. Never include 
                               <span><strong>Stop rejected:</strong> {msg.stopReason}</span>
                             </div>
                           )}
+                          {/* Checkpoint revert — undo every file this turn changed */}
+                          {msg.checkpoint?.files?.length > 0 && !msg.reverted && (
+                            <div style={{ marginTop:10, display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
+                              <button onClick={()=>revertCheckpoint(i)}
+                                title={`Restore:\n${msg.checkpoint.files.join("\n")}`}
+                                style={{ background:"rgba(251,146,60,0.08)", border:"1px solid rgba(251,146,60,0.3)", color:"#fb923c", cursor:"pointer", borderRadius:6, padding:"4px 12px", fontSize:11, fontFamily:"inherit", fontWeight:500 }}>
+                                ↩ Revert {msg.checkpoint.files.length} file change{msg.checkpoint.files.length>1?"s":""}
+                              </button>
+                              <span style={{ fontSize:10, color:"var(--tny-tx5)", fontFamily:"'JetBrains Mono',monospace", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", maxWidth:340 }}>
+                                {msg.checkpoint.files.map(f=>f.split("/").pop()).join(", ")}
+                              </span>
+                            </div>
+                          )}
+                          {msg.reverted && (
+                            <div style={{ marginTop:8, fontSize:11, color:"#fb923c", fontFamily:"'JetBrains Mono',monospace" }}>
+                              ↩ {msg.reverted}
+                            </div>
+                          )}
                         </div>
                       )}
 
@@ -3980,14 +4435,84 @@ After getting results, give your final answer in normal markdown. Never include 
           </div>{/* /inner-column */}
         </div>
 
+        {/* background processes strip */}
+        {bgProcs.length > 0 && (
+          <div style={{ padding:"6px 18px", background:"rgba(56,189,248,0.05)", borderTop:"1px solid rgba(56,189,248,0.18)", display:"flex", alignItems:"center", gap:8, flexWrap:"wrap", flexShrink:0 }}>
+            <span style={{ fontSize:10, color:"var(--tny-tx5)", textTransform:"uppercase", letterSpacing:"0.06em", flexShrink:0 }}>🔄 Background</span>
+            {bgProcs.map(p => (
+              <div key={p.id} style={{ display:"flex", alignItems:"center", gap:6, background:"var(--tny-code)", border:`1px solid ${p.status==="running"?"rgba(56,189,248,0.3)":"var(--tny-line2)"}`, borderRadius:6, padding:"2px 8px", fontSize:10.5, fontFamily:"'JetBrains Mono',monospace" }}>
+                <span style={{ width:6, height:6, borderRadius:"50%", background:p.status==="running"?"#38bdf8":p.exit_code===0?"#22c55e":"#ef4444", flexShrink:0 }}/>
+                <span style={{ color:"var(--tny-tx3)", maxWidth:260, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }} title={p.command}>{p.command}</span>
+                <span style={{ color:"var(--tny-tx5)" }}>{p.status==="running" ? `${p.elapsed_s}s` : `exit ${p.exit_code}`}</span>
+                <button onClick={()=>killBgProc(p.id)} title={p.status==="running"?"Kill process":"Remove from list"}
+                  style={{ background:"none", border:"none", color:p.status==="running"?"#ef4444":"var(--tny-tx4)", cursor:"pointer", fontSize:11, padding:0, lineHeight:1 }}>
+                  {p.status==="running" ? "■" : "✕"}
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* plan approval gate */}
+        {pendingPlan !== null && (
+          <div style={{ padding:"10px 18px 12px", background:"rgba(167,139,250,0.06)", borderTop:"1px solid rgba(167,139,250,0.25)", display:"flex", flexDirection:"column", gap:8, flexShrink:0, maxHeight:300, overflowY:"auto" }}>
+            <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+              <span style={{ fontSize:13 }}>🗒️</span>
+              <span style={{ fontSize:12, fontWeight:600, color:"var(--tny-tx2)" }}>Plan: {pendingPlan.title}</span>
+              <span style={{ fontSize:10, color:"var(--tny-tx5)" }}>· awaiting your approval</span>
+            </div>
+            <ol style={{ margin:0, paddingLeft:34, display:"flex", flexDirection:"column", gap:3 }}>
+              {pendingPlan.steps.map((s, i) => (
+                <li key={i} style={{ fontSize:12, color:"var(--tny-tx3)", lineHeight:1.5 }}>{s}</li>
+              ))}
+            </ol>
+            <div style={{ display:"flex", alignItems:"center", gap:8, marginLeft:23 }}>
+              <button onClick={approvePlan}
+                style={{ background:"rgba(34,197,94,0.14)", border:"1px solid rgba(34,197,94,0.35)", color:"#22c55e", cursor:"pointer", borderRadius:6, padding:"5px 16px", fontSize:11, fontFamily:"inherit", fontWeight:600, flexShrink:0 }}>
+                ✓ Approve plan
+              </button>
+              <input value={planFeedback} onChange={e=>setPlanFeedback(e.target.value)}
+                onKeyDown={e=>{ if (e.key==="Enter" && planFeedback.trim()) rejectPlan(); }}
+                placeholder="What should change? (optional)"
+                style={{ flex:1, background:"var(--tny-surface)", border:"1px solid var(--tny-line2)", borderRadius:6, padding:"5px 9px", fontSize:11, color:"var(--tny-tx1)", fontFamily:"inherit", outline:"none", minWidth:0 }}/>
+              <button onClick={rejectPlan}
+                style={{ background:"none", border:"1px solid rgba(251,146,60,0.35)", color:"#fb923c", cursor:"pointer", borderRadius:6, padding:"5px 12px", fontSize:11, fontFamily:"inherit", flexShrink:0 }}>
+                ↺ Request changes
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* tool permission gate */}
         {pendingCmd !== null && (
-          <div style={{ padding:"8px 18px", background:"rgba(234,179,8,0.07)", borderTop:"1px solid rgba(234,179,8,0.22)", display:"flex", alignItems:"center", gap:10, flexShrink:0 }}>
-            <span style={{ fontSize:13, flexShrink:0 }}>⚠️</span>
-            <span style={{ fontSize:11, color:"var(--tny-tx3)", flexShrink:0, fontWeight:600 }}>{pendingCmd.name}</span>
-            <code style={{ flex:1, fontSize:11, color:"#fbbf24", fontFamily:"'JetBrains Mono',monospace", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", minWidth:0 }}>{pendingCmd.detail}</code>
-            <button onClick={allowCmd} style={{ background:"rgba(34,197,94,0.14)", border:"1px solid rgba(34,197,94,0.35)", color:"#22c55e", cursor:"pointer", borderRadius:6, padding:"4px 14px", fontSize:11, fontFamily:"inherit", fontWeight:600, flexShrink:0 }}>Allow</button>
-            <button onClick={denyCmd}  style={{ background:"none", border:"1px solid var(--tny-line2)", color:"var(--tny-tx4)", cursor:"pointer", borderRadius:6, padding:"4px 10px", fontSize:11, fontFamily:"inherit", flexShrink:0 }}>Deny</button>
+          <div style={{ padding:"8px 18px", background:"rgba(234,179,8,0.07)", borderTop:"1px solid rgba(234,179,8,0.22)", display:"flex", flexDirection:"column", gap:6, flexShrink:0 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+              <span style={{ fontSize:13, flexShrink:0 }}>⚠️</span>
+              <span style={{ fontSize:11, color:"var(--tny-tx3)", flexShrink:0, fontWeight:600 }}>{pendingCmd.name}</span>
+              <code style={{ flex:1, fontSize:11, color:"#fbbf24", fontFamily:"'JetBrains Mono',monospace", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", minWidth:0 }}>{pendingCmd.detail}</code>
+              <button onClick={allowCmd} style={{ background:"rgba(34,197,94,0.14)", border:"1px solid rgba(34,197,94,0.35)", color:"#22c55e", cursor:"pointer", borderRadius:6, padding:"4px 14px", fontSize:11, fontFamily:"inherit", fontWeight:600, flexShrink:0 }}>Allow</button>
+              {pendingCmd.allowSuggestion && (
+                <button onClick={allowCmdAlways} title={`Never ask again for: ${pendingCmd.allowSuggestion.label}`}
+                  style={{ background:"none", border:"1px solid rgba(34,197,94,0.30)", color:"#22c55e", cursor:"pointer", borderRadius:6, padding:"4px 10px", fontSize:11, fontFamily:"inherit", flexShrink:0, whiteSpace:"nowrap" }}>
+                  Always allow
+                </button>
+              )}
+              <button onClick={denyCmd}  style={{ background:"none", border:"1px solid var(--tny-line2)", color:"var(--tny-tx4)", cursor:"pointer", borderRadius:6, padding:"4px 10px", fontSize:11, fontFamily:"inherit", flexShrink:0 }}>Deny</button>
+            </div>
+            {/* Diff preview — what the file change will actually do */}
+            {pendingCmd.diff && (
+              <div style={{ marginLeft:23, background:"var(--tny-code)", border:"1px solid var(--tny-line2)", borderRadius:7, padding:"6px 0", maxHeight:180, overflow:"auto", fontFamily:"'JetBrains Mono',monospace", fontSize:10.5, lineHeight:1.55 }}>
+                {pendingCmd.diff.map((l, i) => (
+                  <div key={i} style={{
+                    padding:"0 10px", whiteSpace:"pre-wrap", wordBreak:"break-all",
+                    color: l.sign === "-" ? "#f87171" : l.sign === "+" ? "#4ade80" : "var(--tny-tx5)",
+                    background: l.sign === "-" ? "rgba(239,68,68,0.07)" : l.sign === "+" ? "rgba(34,197,94,0.07)" : "transparent",
+                  }}>
+                    {l.sign === " " ? "  " : l.sign + " "}{l.text}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 

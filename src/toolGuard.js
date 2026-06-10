@@ -16,8 +16,10 @@
 // These trigger the approval prompt; read-only tools (search, read, list, git_*) do not.
 export const MUTATING_TOOLS = new Set([
   "run_command",
+  "run_background",
   "python_exec",
   "write_file",
+  "edit_file",
 ]);
 
 export function isMutatingTool(name) {
@@ -136,13 +138,13 @@ export function dangerousReason(text) {
 // Combined guard for a single tool call. Returns { blocked, reason }.
 // `args` is the parsed argument object for the tool.
 export function guardToolCall(name, args = {}) {
-  if (name === "run_command") {
+  if (name === "run_command" || name === "run_background") {
     const r = dangerousReason(args.command);
     if (r) return { blocked: true, reason: r };
   } else if (name === "python_exec") {
     const r = dangerousReason(args.code);
     if (r) return { blocked: true, reason: r };
-  } else if (name === "write_file") {
+  } else if (name === "write_file" || name === "edit_file") {
     const r = protectedPathReason(args.path);
     if (r) return { blocked: true, reason: r };
   }
@@ -190,10 +192,72 @@ export function wrapUntrustedContent(source, text) {
     `----- BEGIN UNTRUSTED CONTENT -----\n${body}\n----- END UNTRUSTED CONTENT -----`;
 }
 
+// ── Persistent approval allowlist ─────────────────────────────────────────────
+// "Always allow" support for the approval prompt. Entries: { tool, pattern }.
+//   run_command          → pattern is a command prefix ("npm test", "git status")
+//   write_file/edit_file → pattern is a directory prefix the path must live under
+//   mcp__*               → pattern is the exact namespaced tool name
+// The allowlist NEVER bypasses the hard denylist (guardToolCall runs first) and
+// the caller must keep prompting when untrusted web content is in context.
+
+// Shell metacharacters that make a command non-generalizable: chaining, subshells,
+// redirection, expansion. Commands containing these never match (and are never
+// suggested) — "npm test && rm -rf ~" must not ride an "npm test" allowlist entry.
+const SHELL_META_RE = /[;&|<>`$\\]|\(\)|\$\(/;
+
+function firstTokens(cmd, n = 2) {
+  return String(cmd || "").trim().split(/\s+/).slice(0, n).join(" ");
+}
+
+// Suggest an allowlist pattern for a pending tool call, or null when the call
+// can't be safely generalized (compound shell commands, arbitrary python code).
+export function suggestAllowPattern(name, args = {}) {
+  if (name === "run_command" || name === "run_background") {
+    const cmd = String(args.command || "").trim();
+    if (!cmd || SHELL_META_RE.test(cmd)) return null;
+    const pattern = firstTokens(cmd, 2);
+    if (!pattern) return null;
+    return { tool: name, pattern, label: `${pattern} …` };
+  }
+  if (name === "write_file" || name === "edit_file") {
+    const p = String(args.path || "").trim();
+    if (!p || !p.startsWith("/")) return null;
+    const dir = p.slice(0, p.lastIndexOf("/") + 1);
+    if (!dir || dir === "/") return null;
+    return { tool: name, pattern: dir, label: `${name === "write_file" ? "writes" : "edits"} in ${dir}` };
+  }
+  if (name.startsWith("mcp__")) {
+    return { tool: name, pattern: name, label: name };
+  }
+  return null; // python_exec & unknown tools: never generalizable
+}
+
+// Does this tool call match a stored allowlist entry?
+export function isAllowlisted(allowlist, name, args = {}) {
+  if (!Array.isArray(allowlist) || allowlist.length === 0) return false;
+  const entries = allowlist.filter(e => e && e.tool === name && e.pattern);
+
+  if (name === "run_command" || name === "run_background") {
+    const cmd = String(args.command || "").trim();
+    if (!cmd || SHELL_META_RE.test(cmd)) return false; // compound commands always prompt
+    return entries.some(e => cmd === e.pattern || cmd.startsWith(e.pattern + " "));
+  }
+  if (name === "write_file" || name === "edit_file") {
+    const p = String(args.path || "").trim();
+    return entries.some(e => p.startsWith(e.pattern));
+  }
+  if (name.startsWith("mcp__")) {
+    return entries.some(e => e.pattern === name);
+  }
+  return false;
+}
+
 // Short human-readable detail shown in the approval prompt for each tool.
 export function toolApprovalDetail(name, args = {}) {
-  if (name === "run_command") return String(args.command || "");
-  if (name === "write_file")  return `write → ${args.path || "?"}`;
+  if (name === "run_command")    return String(args.command || "");
+  if (name === "run_background") return `background → ${args.command || "?"}`;
+  if (name === "write_file")     return `write → ${args.path || "?"}`;
+  if (name === "edit_file")      return `edit → ${args.path || "?"}`;
   if (name === "python_exec") return String(args.code || "").split("\n")[0].slice(0, 120);
   if (name.startsWith("mcp__")) {
     let a = args;

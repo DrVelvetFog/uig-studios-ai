@@ -6,8 +6,16 @@ use std::sync::{
 use futures_util::StreamExt;
 use tauri::{AppHandle, Emitter, State};
 
-// ── Cancel token shared across commands ──────────────────────────────────────
-pub struct StreamCancelToken(Arc<AtomicBool>);
+// ── Per-stream cancel tokens ──────────────────────────────────────────────────
+// One flag per active stream (keyed by event_id) so concurrent sessions can
+// stream independently and aborting one never touches the others.
+pub struct StreamCancelMap(std::sync::Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>);
+
+impl StreamCancelMap {
+    pub fn new() -> Self {
+        Self(std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+}
 
 // ── Filesystem helpers ────────────────────────────────────────────────────────
 fn tonyai_dir() -> Result<PathBuf, String> {
@@ -226,6 +234,117 @@ fn save_memory(content: String) -> Result<(), String> {
     std::fs::write(&path, content).map_err(|e| e.to_string())
 }
 
+// ── Session store ─────────────────────────────────────────────────────────────
+// One JSON file per session in ~/.tonyai/sessions/ — replaces localStorage,
+// which silently loses data past its ~5MB quota. Generated images are extracted
+// to ~/.tonyai/session-images/ and referenced by path.
+
+fn session_id_ok(id: &str) -> bool {
+    !id.is_empty() && id.len() < 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+#[tauri::command]
+fn save_session(id: String, data: String) -> Result<(), String> {
+    if !session_id_ok(&id) { return Err("invalid session id".into()); }
+    let dir = tonyai_dir()?.join("sessions");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join(format!("{}.json", id)), data).map_err(|e| e.to_string())
+}
+
+/// Read every stored session, returned as a JSON array sorted by id (= creation time).
+#[tauri::command]
+fn read_sessions() -> Result<String, String> {
+    let dir = tonyai_dir()?.join("sessions");
+    if !dir.exists() { return Ok("[]".into()); }
+    let mut named: Vec<(String, serde_json::Value)> = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())?.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("json") { continue; }
+        if let Ok(content) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+                let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                named.push((stem, v));
+            }
+        }
+    }
+    named.sort_by(|a, b| {
+        let na = a.0.parse::<u64>().unwrap_or(0);
+        let nb = b.0.parse::<u64>().unwrap_or(0);
+        na.cmp(&nb)
+    });
+    let items: Vec<serde_json::Value> = named.into_iter().map(|(_, v)| v).collect();
+    serde_json::to_string(&items).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_session_file(id: String) -> Result<(), String> {
+    if !session_id_ok(&id) { return Err("invalid session id".into()); }
+    let path = tonyai_dir()?.join("sessions").join(format!("{}.json", id));
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Save a generated image out of a session into ~/.tonyai/session-images/.
+/// Returns the absolute path for by-reference storage in the session JSON.
+#[tauri::command]
+fn save_session_image(name: String, base64: String) -> Result<String, String> {
+    if !session_id_ok(&name) { return Err("invalid image name".into()); }
+    let dir = tonyai_dir()?.join("session-images");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let b64_data = if let Some(pos) = base64.find(',') {
+        base64[pos + 1..].trim().to_string()
+    } else {
+        base64.trim().to_string()
+    };
+    use ::base64::{Engine as _, engine::general_purpose::STANDARD};
+    let bytes = STANDARD.decode(&b64_data).map_err(|e| format!("base64 decode: {e}"))?;
+    let path = dir.join(format!("{}.png", name));
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Read a session image back as a data URI (only from the session-images dir).
+#[tauri::command]
+fn read_session_image(path: String) -> Result<String, String> {
+    let allowed = tonyai_dir()?.join("session-images");
+    let p = PathBuf::from(&path);
+    if !p.starts_with(&allowed) {
+        return Err("Access denied: not a session image".into());
+    }
+    let bytes = std::fs::read(&p).map_err(|e| e.to_string())?;
+    use ::base64::{Engine as _, engine::general_purpose::STANDARD};
+    Ok(format!("data:image/png;base64,{}", STANDARD.encode(&bytes)))
+}
+
+#[cfg(test)]
+mod session_store_tests {
+    use super::*;
+
+    #[test]
+    fn save_read_delete_roundtrip() {
+        let id = format!("99999999{}", std::process::id());
+        save_session(id.clone(), r#"{"id":1,"title":"t","messages":[]}"#.into()).unwrap();
+        let all = read_sessions().unwrap();
+        assert!(all.contains("\"title\":\"t\"") || all.contains("\"title\": \"t\""));
+        delete_session_file(id.clone()).unwrap();
+        assert!(save_session("../evil".into(), "{}".into()).is_err());
+    }
+
+    #[test]
+    fn session_image_roundtrip() {
+        // 1x1 transparent PNG
+        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+        let name = format!("imgtest{}", std::process::id());
+        let path = save_session_image(name, format!("data:image/png;base64,{png_b64}")).unwrap();
+        let back = read_session_image(path.clone()).unwrap();
+        assert!(back.starts_with("data:image/png;base64,"));
+        assert!(read_session_image("/etc/passwd".into()).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 // ── Secret storage ────────────────────────────────────────────────────────────
 // API keys live in ~/.tonyai/secret-<key>.txt (mode 0600), NOT in the webview's
 // localStorage — so untrusted page content rendered in the agent cannot scrape them.
@@ -273,6 +392,68 @@ fn append_log(line: String) -> Result<(), String> {
         .create(true).append(true).open(&path)
         .map_err(|e| e.to_string())?;
     writeln!(f, "{}", line).map_err(|e| e.to_string())
+}
+
+// ── Self-update from source ──────────────────────────────────────────────────
+// No public release host exists for this app, so "auto-update" means: rebuild
+// the local source tree and reinstall to /Applications. Runs detached so the
+// build survives the app being replaced; output goes to ~/.tonyai/logs/update.log.
+
+#[tauri::command]
+fn launch_self_update(source_dir: String) -> Result<String, String> {
+    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+    if !source_dir.starts_with(&home) {
+        return Err("Source directory must be under $HOME".into());
+    }
+    let script = PathBuf::from(&source_dir).join("scripts").join("update-app.sh");
+    if !script.is_file() {
+        return Err(format!("Update script not found: {}", script.display()));
+    }
+    let log_dir = tonyai_dir()?.join("logs");
+    std::fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
+    let log = log_dir.join("update.log");
+
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "nohup zsh '{}' > '{}' 2>&1 &",
+            script.display(), log.display()
+        ))
+        .spawn()
+        .map_err(|e| format!("Could not start update: {e}"))?;
+
+    Ok(format!(
+        "Update started in the background — tests, build, install (~3-5 min). \
+         Progress: {} . Quit and relaunch TonyAI when it finishes.",
+        log.display()
+    ))
+}
+
+// ── Agent telemetry ───────────────────────────────────────────────────────────
+// One JSON line per agent run in ~/.tonyai/telemetry.jsonl — model, loops,
+// tool calls, stop rejections, outcome, duration. Rotates at 5 MB.
+
+#[tauri::command]
+fn append_telemetry(line: String) -> Result<(), String> {
+    use std::io::Write;
+    let dir = tonyai_dir()?;
+    let path = dir.join("telemetry.jsonl");
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 5 * 1024 * 1024 {
+            let _ = std::fs::rename(&path, dir.join("telemetry.jsonl.1"));
+        }
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true).append(true).open(&path)
+        .map_err(|e| e.to_string())?;
+    writeln!(f, "{}", line.replace('\n', " ")).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn read_telemetry() -> Result<String, String> {
+    let path = tonyai_dir()?.join("telemetry.jsonl");
+    if !path.exists() { return Ok(String::new()); }
+    std::fs::read_to_string(&path).map_err(|e| e.to_string())
 }
 
 /// Read all memory .md files from ~/TonyAI-Projects/memory/.
@@ -402,12 +583,22 @@ async fn ollama_post(path: String, body: String) -> Result<String, String> {
 #[tauri::command]
 async fn ollama_chat(
     app: AppHandle,
-    cancel: State<'_, StreamCancelToken>,
+    cancel: State<'_, StreamCancelMap>,
     body: String,
     event_id: String,
 ) -> Result<(), String> {
-    // Reset cancel flag for this new request
-    cancel.0.store(false, Ordering::Relaxed);
+    // Register a fresh cancel flag for this stream
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    cancel.0.lock().unwrap().insert(event_id.clone(), Arc::clone(&cancel_flag));
+
+    // Ensure the flag is removed from the registry on every exit path
+    struct CancelCleanup<'a>(&'a StreamCancelMap, String);
+    impl<'a> Drop for CancelCleanup<'a> {
+        fn drop(&mut self) {
+            self.0.0.lock().unwrap().remove(&self.1);
+        }
+    }
+    let _cleanup = CancelCleanup(&cancel, event_id.clone());
 
     let response = reqwest::Client::new()
         .post(format!("{}/api/chat", OLLAMA_URL))
@@ -423,7 +614,6 @@ async fn ollama_chat(
         return Err(format!("Ollama {}: {}", status, text));
     }
 
-    let cancel_flag = cancel.0.clone();
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
     let mut last_emit = std::time::Instant::now();
@@ -453,10 +643,23 @@ async fn ollama_chat(
     Ok(())
 }
 
-/// Signals the active stream to stop after the current chunk.
+/// Signals a stream to stop after the current chunk.
+/// event_id targets one stream; None aborts all active streams (legacy behavior).
 #[tauri::command]
-fn ollama_abort(cancel: State<'_, StreamCancelToken>) {
-    cancel.0.store(true, Ordering::Relaxed);
+fn ollama_abort(cancel: State<'_, StreamCancelMap>, event_id: Option<String>) {
+    let map = cancel.0.lock().unwrap();
+    match event_id {
+        Some(id) => {
+            if let Some(flag) = map.get(&id) {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+        None => {
+            for flag in map.values() {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 // ── Agent tool commands ───────────────────────────────────────────────────────
@@ -944,6 +1147,107 @@ fn tool_write_file(path: String, content: String) -> Result<String, String> {
     Ok(format!("Written {} bytes to {}", content.len(), path))
 }
 
+/// Surgical search/replace edit on an existing file (home directory or /tmp only).
+/// old_string must match the file content exactly. If it matches more than once,
+/// the edit is rejected unless replace_all is set — prevents ambiguous edits.
+#[tauri::command]
+fn tool_edit_file(
+    path: String,
+    old_string: String,
+    new_string: String,
+    replace_all: Option<bool>,
+) -> Result<String, String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let allowed_prefixes = [home.as_str(), "/tmp"];
+    if !allowed_prefixes.iter().any(|p| path.starts_with(p)) {
+        return Err("Access denied: only files under $HOME or /tmp are editable".into());
+    }
+    if old_string.is_empty() {
+        return Err("old_string is empty — provide the exact text to replace".into());
+    }
+    if old_string == new_string {
+        return Err("old_string and new_string are identical — nothing to change".into());
+    }
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(format!("Not found: {} — use write_file to create new files", path));
+    }
+    let content = std::fs::read_to_string(p)
+        .map_err(|e| format!("Cannot read {}: {}", path, e))?;
+    let count = content.matches(&old_string).count();
+    if count == 0 {
+        return Err(format!(
+            "old_string not found in {}. Read the file first and copy the exact text, including whitespace and indentation.",
+            path
+        ));
+    }
+    let all = replace_all.unwrap_or(false);
+    if count > 1 && !all {
+        return Err(format!(
+            "old_string matches {} times in {} — include more surrounding lines to make it unique, or set replace_all=true to change every occurrence.",
+            count, path
+        ));
+    }
+    let updated = if all {
+        content.replace(&old_string, &new_string)
+    } else {
+        content.replacen(&old_string, &new_string, 1)
+    };
+    std::fs::write(p, &updated).map_err(|e| e.to_string())?;
+    let n = if all { count } else { 1 };
+    Ok(format!("Replaced {} occurrence{} in {}", n, if n == 1 { "" } else { "s" }, path))
+}
+
+#[cfg(test)]
+mod edit_file_tests {
+    use super::*;
+
+    fn tmp_file(name: &str, content: &str) -> String {
+        let path = format!("/tmp/tonyai_test_{}", name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn replaces_unique_match() {
+        let p = tmp_file("unique.txt", "alpha\nbeta\ngamma\n");
+        let r = tool_edit_file(p.clone(), "beta".into(), "BETA".into(), None);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "alpha\nBETA\ngamma\n");
+    }
+
+    #[test]
+    fn rejects_ambiguous_match() {
+        let p = tmp_file("ambig.txt", "x\nx\n");
+        let r = tool_edit_file(p, "x".into(), "y".into(), None);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("2 times"));
+    }
+
+    #[test]
+    fn replace_all_changes_every_occurrence() {
+        let p = tmp_file("all.txt", "x\nx\n");
+        let r = tool_edit_file(p.clone(), "x".into(), "y".into(), Some(true));
+        assert!(r.is_ok());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "y\ny\n");
+    }
+
+    #[test]
+    fn rejects_missing_old_string() {
+        let p = tmp_file("missing.txt", "hello\n");
+        let r = tool_edit_file(p, "nope".into(), "y".into(), None);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn rejects_path_outside_home_and_tmp() {
+        let r = tool_edit_file("/etc/hosts".into(), "a".into(), "b".into(), None);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("Access denied"));
+    }
+}
+
 /// List contents of a directory (home directory only).
 #[tauri::command]
 fn tool_list_dir(path: String) -> Result<String, String> {
@@ -1197,17 +1501,19 @@ async fn tool_python_exec(
     })
 }
 
-/// Run a shell command and return its output (30s timeout).
+/// Run a shell command and return its output.
+/// timeout_seconds: default 30, max 600 — raise it for builds / test suites.
 #[tauri::command]
-async fn tool_run_command(command: String) -> Result<String, String> {
+async fn tool_run_command(command: String, timeout_seconds: Option<u64>) -> Result<String, String> {
+    let timeout_s = timeout_seconds.unwrap_or(30).clamp(1, 600);
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(timeout_s),
         tokio::process::Command::new("sh")
             .arg("-c")
             .arg(&command)
             .output(),
     ).await
-    .map_err(|_| "Command timed out after 30s".to_string())?
+    .map_err(|_| format!("Command timed out after {}s. For servers or watch tasks use run_background instead; for long builds pass a larger timeout_seconds (max 600).", timeout_s))?
     .map_err(|e| format!("Failed to run command: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&result.stdout).to_string();
@@ -1227,6 +1533,400 @@ async fn tool_run_command(command: String) -> Result<String, String> {
     })
 }
 
+// ── Per-project instructions (TONYAI.md) ─────────────────────────────────────
+// Walk up from a path the agent is working in, looking for a TONYAI.md file —
+// standing instructions for that project (conventions, run commands, gotchas).
+// Returns {"path": ..., "content": ...} as JSON, or "null" when none found.
+
+#[tauri::command]
+fn find_project_instructions(path: String) -> Result<String, String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() || (!path.starts_with(&home) && !path.starts_with("/tmp")) {
+        return Ok("null".into());
+    }
+    let mut dir = PathBuf::from(&path);
+    if dir.is_file() || dir.extension().is_some() { dir.pop(); }
+
+    let home_path = PathBuf::from(&home);
+    loop {
+        let candidate = dir.join("TONYAI.md");
+        if candidate.is_file() {
+            let mut content = std::fs::read_to_string(&candidate).unwrap_or_default();
+            if content.chars().count() > 8000 {
+                content = content.chars().take(8000).collect::<String>() + "\n[...truncated]";
+            }
+            let json = serde_json::json!({
+                "path": candidate.to_string_lossy(),
+                "content": content,
+            });
+            return Ok(json.to_string());
+        }
+        // Stop after checking the home dir / tmp root themselves
+        if dir == home_path || dir == PathBuf::from("/tmp") { break; }
+        if !dir.pop() { break; }
+    }
+    Ok("null".into())
+}
+
+#[cfg(test)]
+mod project_instructions_tests {
+    use super::*;
+
+    #[test]
+    fn finds_tonyai_md_walking_up() {
+        let root = format!("/tmp/tonyai_proj_test_{}", std::process::id());
+        let sub  = format!("{root}/src/deep");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(format!("{root}/TONYAI.md"), "Use tabs. Run `make test`.").unwrap();
+
+        let raw = find_project_instructions(format!("{sub}/main.py")).unwrap();
+        assert_ne!(raw, "null");
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(v["path"].as_str().unwrap().ends_with("TONYAI.md"));
+        assert!(v["content"].as_str().unwrap().contains("make test"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn returns_null_when_absent_or_out_of_bounds() {
+        assert_eq!(find_project_instructions("/tmp".into()).unwrap_or_default().len() <= 4, true);
+        assert_eq!(find_project_instructions("/etc/hosts".into()).unwrap(), "null");
+    }
+}
+
+// ── File checkpoints (agent-turn rewind) ─────────────────────────────────────
+// Before the agent mutates a file, snapshot the original under
+// ~/.tonyai/checkpoints/<turn_id>/. A manifest maps backups to original paths
+// so one revert call restores every file the turn touched (and deletes files
+// the turn created). Keeps the most recent 20 turn checkpoints.
+
+fn checkpoints_dir() -> Result<PathBuf, String> {
+    Ok(tonyai_dir()?.join("checkpoints"))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CheckpointEntry {
+    path:   String,           // original absolute path
+    action: String,           // "modified" | "created"
+    backup: Option<String>,   // backup filename inside the checkpoint dir
+}
+
+fn read_manifest(dir: &std::path::Path) -> Vec<CheckpointEntry> {
+    std::fs::read_to_string(dir.join("manifest.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_manifest(dir: &std::path::Path, entries: &[CheckpointEntry]) -> Result<(), String> {
+    let json = serde_json::to_string(entries).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("manifest.json"), json).map_err(|e| e.to_string())
+}
+
+fn prune_checkpoints(base: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(base) else { return };
+    let mut dirs: Vec<PathBuf> = entries.flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort(); // turn ids are ckpt_<millis> — lexicographic == chronological
+    while dirs.len() > keep {
+        let oldest = dirs.remove(0);
+        let _ = std::fs::remove_dir_all(oldest);
+    }
+}
+
+fn ckpt_id_ok(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Snapshot `path` into checkpoint `turn_id` before it gets mutated.
+/// Idempotent per (turn_id, path) — only the first call snapshots.
+#[tauri::command]
+fn checkpoint_file(turn_id: String, path: String) -> Result<String, String> {
+    if !ckpt_id_ok(&turn_id) { return Err("invalid checkpoint id".into()); }
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !path.starts_with(&home) && !path.starts_with("/tmp") {
+        return Err("Access denied: only files under $HOME or /tmp are checkpointable".into());
+    }
+
+    let base = checkpoints_dir()?;
+    let dir  = base.join(&turn_id);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let mut entries = read_manifest(&dir);
+    if entries.iter().any(|e| e.path == path) {
+        return Ok("already checkpointed".into());
+    }
+
+    let src = std::path::Path::new(&path);
+    if src.exists() {
+        let backup_name = format!("{}.bak", entries.len());
+        std::fs::copy(src, dir.join(&backup_name))
+            .map_err(|e| format!("backup copy failed: {e}"))?;
+        entries.push(CheckpointEntry { path, action: "modified".into(), backup: Some(backup_name) });
+    } else {
+        entries.push(CheckpointEntry { path, action: "created".into(), backup: None });
+    }
+    write_manifest(&dir, &entries)?;
+    prune_checkpoints(&base, 20);
+    Ok("checkpointed".into())
+}
+
+/// Restore every file recorded in checkpoint `turn_id` to its pre-turn state.
+#[tauri::command]
+fn checkpoint_revert(turn_id: String) -> Result<String, String> {
+    if !ckpt_id_ok(&turn_id) { return Err("invalid checkpoint id".into()); }
+    let dir = checkpoints_dir()?.join(&turn_id);
+    if !dir.exists() { return Err(format!("Checkpoint {} not found (pruned?)", turn_id)); }
+
+    let entries = read_manifest(&dir);
+    if entries.is_empty() { return Err("Checkpoint has no recorded files".into()); }
+
+    let mut restored = 0usize;
+    let mut deleted  = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+
+    for e in &entries {
+        match (e.action.as_str(), &e.backup) {
+            ("modified", Some(b)) => {
+                match std::fs::copy(dir.join(b), &e.path) {
+                    Ok(_)  => restored += 1,
+                    Err(err) => failures.push(format!("{}: {}", e.path, err)),
+                }
+            }
+            ("created", _) => {
+                match std::fs::remove_file(&e.path) {
+                    Ok(_) => deleted += 1,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => deleted += 1,
+                    Err(err) => failures.push(format!("{}: {}", e.path, err)),
+                }
+            }
+            _ => failures.push(format!("{}: malformed manifest entry", e.path)),
+        }
+    }
+
+    let mut msg = format!("Reverted: {} file(s) restored, {} created file(s) removed", restored, deleted);
+    if !failures.is_empty() {
+        msg.push_str(&format!("; {} failure(s): {}", failures.len(), failures.join("; ")));
+    }
+    Ok(msg)
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn checkpoint_and_revert_modified_and_created() {
+        let id = format!("ckpt_test_{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let modified = format!("/tmp/tonyai_ckpt_mod_{id}.txt");
+        let created  = format!("/tmp/tonyai_ckpt_new_{id}.txt");
+
+        std::fs::write(&modified, "original").unwrap();
+
+        // Snapshot before mutation
+        checkpoint_file(id.clone(), modified.clone()).unwrap();
+        checkpoint_file(id.clone(), created.clone()).unwrap(); // doesn't exist yet → "created"
+
+        // Idempotent per path
+        assert_eq!(checkpoint_file(id.clone(), modified.clone()).unwrap(), "already checkpointed");
+
+        // Mutate
+        std::fs::write(&modified, "agent overwrote this").unwrap();
+        std::fs::write(&created, "agent made this").unwrap();
+
+        // Revert
+        let msg = checkpoint_revert(id.clone()).unwrap();
+        assert!(msg.contains("1 file(s) restored"), "{msg}");
+        assert!(msg.contains("1 created file(s) removed"), "{msg}");
+        assert_eq!(std::fs::read_to_string(&modified).unwrap(), "original");
+        assert!(!std::path::Path::new(&created).exists());
+
+        // Cleanup
+        let _ = std::fs::remove_file(&modified);
+        let _ = std::fs::remove_dir_all(checkpoints_dir().unwrap().join(&id));
+    }
+
+    #[test]
+    fn rejects_bad_ids_and_paths() {
+        assert!(checkpoint_file("../evil".into(), "/tmp/x".into()).is_err());
+        assert!(checkpoint_file("ok_id".into(), "/etc/hosts".into()).is_err());
+        assert!(checkpoint_revert("does_not_exist_xyz".into()).is_err());
+    }
+}
+
+// ── Background process registry ──────────────────────────────────────────────
+// Long-running commands (dev servers, builds, watch tasks) that outlive the
+// 30s run_command window. Each process gets a capped output buffer fed by
+// reader tasks; status checks reap exited children via try_wait().
+
+const BG_OUTPUT_CAP: usize = 64_000; // chars kept per process (tail wins)
+
+struct BgProcess {
+    command:   String,
+    output:    Arc<std::sync::Mutex<String>>,
+    exit_code: Arc<std::sync::Mutex<Option<i32>>>,
+    child:     Arc<TokioMutex<Option<tokio::process::Child>>>,
+    started:   std::time::SystemTime,
+}
+
+pub struct ProcessManager {
+    procs: Arc<TokioMutex<StdHashMap<String, BgProcess>>>,
+}
+
+impl ProcessManager {
+    pub fn new() -> Self {
+        Self { procs: Arc::new(TokioMutex::new(StdHashMap::new())) }
+    }
+}
+
+fn bg_append(buf: &Arc<std::sync::Mutex<String>>, line: &str) {
+    if let Ok(mut s) = buf.lock() {
+        s.push_str(line);
+        s.push('\n');
+        if s.len() > BG_OUTPUT_CAP {
+            let cut = s.len() - BG_OUTPUT_CAP;
+            // Cut on a char boundary at or after the byte offset
+            let cut = s.char_indices().map(|(i, _)| i).find(|&i| i >= cut).unwrap_or(0);
+            s.drain(..cut);
+        }
+    }
+}
+
+/// Update exit_code from the child if it has exited (reaps the process).
+async fn bg_refresh_exit(p: &BgProcess) {
+    let mut guard = p.child.lock().await;
+    if let Some(child) = guard.as_mut() {
+        if let Ok(Some(status)) = child.try_wait() {
+            *p.exit_code.lock().unwrap() = Some(status.code().unwrap_or(-1));
+            *guard = None; // reaped — drop the handle
+        }
+    }
+}
+
+/// Start a long-running shell command in the background. Returns its process id.
+#[tauri::command]
+async fn tool_run_background(
+    state: tauri::State<'_, ProcessManager>,
+    command: String,
+) -> Result<String, String> {
+    let mut child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to start: {}", e))?;
+
+    let id = format!("bg_{}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+    let output: Arc<std::sync::Mutex<String>> = Arc::new(std::sync::Mutex::new(String::new()));
+
+    // Reader tasks — stream stdout/stderr lines into the capped buffer
+    if let Some(stdout) = child.stdout.take() {
+        let buf = Arc::clone(&output);
+        tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await { bg_append(&buf, &line); }
+        });
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let buf = Arc::clone(&output);
+        tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await { bg_append(&buf, &line); }
+        });
+    }
+
+    state.procs.lock().await.insert(id.clone(), BgProcess {
+        command: command.clone(),
+        output,
+        exit_code: Arc::new(std::sync::Mutex::new(None)),
+        child: Arc::new(TokioMutex::new(Some(child))),
+        started: std::time::SystemTime::now(),
+    });
+
+    Ok(format!(
+        "Started background process {} — `{}`. Use process_status(\"{}\") to read its output, process_kill(\"{}\") to stop it.",
+        id, command, id, id
+    ))
+}
+
+/// Status + recent output of a background process.
+#[tauri::command]
+async fn tool_process_status(
+    state: tauri::State<'_, ProcessManager>,
+    id: String,
+    tail_chars: Option<usize>,
+) -> Result<String, String> {
+    let procs = state.procs.lock().await;
+    let p = procs.get(&id).ok_or_else(|| format!("No such process: {}", id))?;
+    bg_refresh_exit(p).await;
+
+    let exit = *p.exit_code.lock().unwrap();
+    let out  = p.output.lock().unwrap().clone();
+    let n    = tail_chars.unwrap_or(4000).min(BG_OUTPUT_CAP);
+    let tail: String = if out.chars().count() > n {
+        let skip = out.chars().count() - n;
+        format!("[...earlier output omitted]\n{}", out.chars().skip(skip).collect::<String>())
+    } else { out };
+
+    let secs = p.started.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+    let status = match exit {
+        Some(code) => format!("EXITED [exit {}]", code),
+        None       => "RUNNING".to_string(),
+    };
+    Ok(format!("{} · `{}` · {}s elapsed\n--- output ---\n{}", status, p.command, secs, tail))
+}
+
+/// Kill a background process and remove it from the registry.
+#[tauri::command]
+async fn tool_process_kill(
+    state: tauri::State<'_, ProcessManager>,
+    id: String,
+) -> Result<String, String> {
+    let mut procs = state.procs.lock().await;
+    let p = procs.get(&id).ok_or_else(|| format!("No such process: {}", id))?;
+    let mut guard = p.child.lock().await;
+    let was_running = if let Some(child) = guard.as_mut() {
+        let _ = child.start_kill();
+        let _ = child.wait().await; // reap
+        true
+    } else { false };
+    drop(guard);
+    procs.remove(&id);
+    Ok(if was_running {
+        format!("Killed {}", id)
+    } else {
+        format!("{} had already exited — removed from registry", id)
+    })
+}
+
+/// List background processes as JSON: [{id, command, status, exit_code, elapsed_s}]
+#[tauri::command]
+async fn tool_process_list(
+    state: tauri::State<'_, ProcessManager>,
+) -> Result<String, String> {
+    let procs = state.procs.lock().await;
+    let mut items = Vec::new();
+    for (id, p) in procs.iter() {
+        bg_refresh_exit(p).await;
+        let exit = *p.exit_code.lock().unwrap();
+        items.push(serde_json::json!({
+            "id": id,
+            "command": p.command,
+            "status": if exit.is_some() { "exited" } else { "running" },
+            "exit_code": exit,
+            "elapsed_s": p.started.elapsed().map(|d| d.as_secs()).unwrap_or(0),
+        }));
+    }
+    serde_json::to_string(&items).map_err(|e| e.to_string())
+}
+
 // ── MCP (Model Context Protocol) server management ───────────────────────────
 //
 // Each MCP server runs as a child process communicating over JSON-RPC / stdio.
@@ -1244,10 +1944,18 @@ use std::sync::atomic::AtomicU64;
 use tokio::sync::{Mutex as TokioMutex, oneshot};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-struct McpServer {
-    stdin:   Arc<TokioMutex<tokio::process::ChildStdin>>,
-    pending: Arc<TokioMutex<StdHashMap<u64, oneshot::Sender<serde_json::Value>>>>,
-    next_id: Arc<AtomicU64>,
+enum McpServer {
+    Stdio {
+        stdin:   Arc<TokioMutex<tokio::process::ChildStdin>>,
+        pending: Arc<TokioMutex<StdHashMap<u64, oneshot::Sender<serde_json::Value>>>>,
+        next_id: Arc<AtomicU64>,
+    },
+    Http {
+        url:     String,
+        auth:    Option<String>,
+        session: Arc<std::sync::Mutex<Option<String>>>, // Mcp-Session-Id from the server
+        next_id: Arc<AtomicU64>,
+    },
 }
 
 pub struct McpManager {
@@ -1294,16 +2002,158 @@ async fn mcp_notify(
         .map_err(|e| format!("MCP notify: {e}"))
 }
 
-/// Start an MCP server subprocess, complete the initialize handshake,
-/// discover its tools, and register it. Returns the tools list as JSON.
+// ── HTTP (streamable) transport ───────────────────────────────────────────────
+// POST each JSON-RPC message to the server URL. Responses arrive as plain JSON
+// or as an SSE stream (we scan `data:` lines for the matching response id).
+// The server's Mcp-Session-Id header is captured and echoed on later requests.
+
+fn mcp_http_headers(
+    req: reqwest::RequestBuilder,
+    auth: &Option<String>,
+    session: &Arc<std::sync::Mutex<Option<String>>>,
+) -> reqwest::RequestBuilder {
+    let mut req = req
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream");
+    if let Some(token) = auth {
+        req = req.header("Authorization", format!("Bearer {}", token));
+    }
+    if let Some(sid) = session.lock().unwrap().clone() {
+        req = req.header("Mcp-Session-Id", sid);
+    }
+    req
+}
+
+async fn mcp_http_rpc(
+    url:     &str,
+    auth:    &Option<String>,
+    session: &Arc<std::sync::Mutex<Option<String>>>,
+    next_id: &Arc<AtomicU64>,
+    method:  &str,
+    params:  serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let id  = next_id.fetch_add(1, Ordering::SeqCst);
+    let req = serde_json::json!({ "jsonrpc":"2.0", "id":id, "method":method, "params":params });
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build().map_err(|e| e.to_string())?;
+    let resp = mcp_http_headers(client.post(url), auth, session)
+        .body(req.to_string())
+        .send().await
+        .map_err(|e| format!("MCP HTTP: {e}"))?;
+
+    // Capture/refresh the session id
+    if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+        *session.lock().unwrap() = Some(sid.to_string());
+    }
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("MCP HTTP {}: {}", status, text.chars().take(300).collect::<String>()));
+    }
+
+    let is_sse = resp.headers().get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("text/event-stream"))
+        .unwrap_or(false);
+    let body = resp.text().await.map_err(|e| e.to_string())?;
+
+    if is_sse {
+        // Scan SSE data lines for the JSON-RPC response with our id
+        for line in body.lines() {
+            let Some(data) = line.strip_prefix("data:") else { continue };
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data.trim()) {
+                if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
+                    return Ok(v);
+                }
+            }
+        }
+        Err("MCP HTTP: no matching response in SSE stream".into())
+    } else {
+        serde_json::from_str(&body).map_err(|e| format!("MCP HTTP parse: {e}"))
+    }
+}
+
+async fn mcp_http_notify(
+    url:     &str,
+    auth:    &Option<String>,
+    session: &Arc<std::sync::Mutex<Option<String>>>,
+    method:  &str,
+) -> Result<(), String> {
+    let note = serde_json::json!({ "jsonrpc":"2.0", "method":method, "params":{} });
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build().map_err(|e| e.to_string())?;
+    let resp = mcp_http_headers(client.post(url), auth, session)
+        .body(note.to_string())
+        .send().await
+        .map_err(|e| format!("MCP HTTP notify: {e}"))?;
+    if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+        *session.lock().unwrap() = Some(sid.to_string());
+    }
+    Ok(())
+}
+
+/// Start an MCP server (stdio subprocess or streamable-HTTP endpoint), complete
+/// the initialize handshake, discover ALL its tools (cursor pagination), and
+/// register it. Returns the tools list as JSON.
 #[tauri::command]
 async fn mcp_initialize(
-    state:    tauri::State<'_, McpManager>,
-    id:       String,
-    command:  String,
-    args:     Vec<String>,
-    env_vars: Option<StdHashMap<String, String>>,
+    state:      tauri::State<'_, McpManager>,
+    id:         String,
+    command:    Option<String>,
+    args:       Option<Vec<String>>,
+    env_vars:   Option<StdHashMap<String, String>>,
+    transport:  Option<String>,
+    url:        Option<String>,
+    auth_token: Option<String>,
 ) -> Result<String, String> {
+    let init_params = serde_json::json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": { "tools": {} },
+        "clientInfo": { "name": "TonyAI", "version": "1.1.0" }
+    });
+
+    // ── HTTP transport ────────────────────────────────────────────────────────
+    if transport.as_deref() == Some("http") {
+        let url = url.filter(|u| !u.trim().is_empty())
+            .ok_or("HTTP transport requires a server URL")?;
+        let auth = auth_token.filter(|t| !t.trim().is_empty());
+        let session: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let next_id = Arc::new(AtomicU64::new(1));
+
+        let init_resp = mcp_http_rpc(&url, &auth, &session, &next_id, "initialize", init_params).await?;
+        if let Some(err) = init_resp.get("error") {
+            return Err(format!("MCP initialize failed: {err}"));
+        }
+        let _ = mcp_http_notify(&url, &auth, &session, "notifications/initialized").await;
+
+        // tools/list with cursor pagination
+        let mut tools: Vec<serde_json::Value> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let params = match &cursor {
+                Some(c) => serde_json::json!({ "cursor": c }),
+                None    => serde_json::json!({}),
+            };
+            let resp = mcp_http_rpc(&url, &auth, &session, &next_id, "tools/list", params).await?;
+            if let Some(page) = resp.pointer("/result/tools").and_then(|t| t.as_array()) {
+                tools.extend(page.iter().cloned());
+            }
+            cursor = resp.pointer("/result/nextCursor").and_then(|c| c.as_str()).map(String::from);
+            if cursor.is_none() || tools.len() > 500 { break; }
+        }
+
+        let tools_json = serde_json::to_string(&tools).map_err(|e| e.to_string())?;
+        state.servers.lock().await.insert(id, McpServer::Http { url, auth, session, next_id });
+        return Ok(tools_json);
+    }
+
+    // ── stdio transport (default) ─────────────────────────────────────────────
+    let command = command.filter(|c| !c.trim().is_empty())
+        .ok_or("stdio transport requires a command")?;
+    let args = args.unwrap_or_default();
     let mut cmd = tokio::process::Command::new(&command);
     cmd.args(&args)
        .stdin(std::process::Stdio::piped())
@@ -1351,31 +2201,31 @@ async fn mcp_initialize(
     }
 
     // MCP handshake
-    let init_resp = mcp_rpc(&child_stdin, &pending, &next_id, "initialize",
-        serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": { "tools": {} },
-            "clientInfo": { "name": "TonyAI", "version": "1.0.0" }
-        })
-    ).await?;
+    let init_resp = mcp_rpc(&child_stdin, &pending, &next_id, "initialize", init_params).await?;
     if let Some(err) = init_resp.get("error") {
         return Err(format!("MCP initialize failed: {err}"));
     }
     mcp_notify(&child_stdin, "notifications/initialized").await?;
 
-    // Discover tools (first page — cursor pagination ignored for v1)
-    let tools_resp = mcp_rpc(&child_stdin, &pending, &next_id, "tools/list",
-        serde_json::json!({})
-    ).await?;
-    let tools: Vec<serde_json::Value> = tools_resp
-        .pointer("/result/tools")
-        .and_then(|t| t.as_array())
-        .cloned()
-        .unwrap_or_default();
+    // Discover ALL tools — cursor pagination
+    let mut tools: Vec<serde_json::Value> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let params = match &cursor {
+            Some(c) => serde_json::json!({ "cursor": c }),
+            None    => serde_json::json!({}),
+        };
+        let resp = mcp_rpc(&child_stdin, &pending, &next_id, "tools/list", params).await?;
+        if let Some(page) = resp.pointer("/result/tools").and_then(|t| t.as_array()) {
+            tools.extend(page.iter().cloned());
+        }
+        cursor = resp.pointer("/result/nextCursor").and_then(|c| c.as_str()).map(String::from);
+        if cursor.is_none() || tools.len() > 500 { break; }
+    }
 
     let tools_json = serde_json::to_string(&tools).map_err(|e| e.to_string())?;
 
-    state.servers.lock().await.insert(id, McpServer {
+    state.servers.lock().await.insert(id, McpServer::Stdio {
         stdin: child_stdin, pending, next_id,
     });
 
@@ -1390,17 +2240,30 @@ async fn mcp_call_tool(
     tool_name: String,
     arguments: serde_json::Value,
 ) -> Result<String, String> {
-    // Clone Arcs before releasing the lock so we don't hold it during the async wait.
-    let (stdin, pending, next_id) = {
+    // Clone transport handles before releasing the lock so we don't hold it
+    // during the async wait.
+    enum Handle {
+        Stdio(Arc<TokioMutex<tokio::process::ChildStdin>>, Arc<TokioMutex<StdHashMap<u64, oneshot::Sender<serde_json::Value>>>>, Arc<AtomicU64>),
+        Http(String, Option<String>, Arc<std::sync::Mutex<Option<String>>>, Arc<AtomicU64>),
+    }
+    let handle = {
         let guard = state.servers.lock().await;
-        let s = guard.get(&server_id)
-            .ok_or_else(|| format!("MCP server '{server_id}' not connected"))?;
-        (Arc::clone(&s.stdin), Arc::clone(&s.pending), Arc::clone(&s.next_id))
+        match guard.get(&server_id)
+            .ok_or_else(|| format!("MCP server '{server_id}' not connected"))? {
+            McpServer::Stdio { stdin, pending, next_id } =>
+                Handle::Stdio(Arc::clone(stdin), Arc::clone(pending), Arc::clone(next_id)),
+            McpServer::Http { url, auth, session, next_id } =>
+                Handle::Http(url.clone(), auth.clone(), Arc::clone(session), Arc::clone(next_id)),
+        }
     };
 
-    let resp = mcp_rpc(&stdin, &pending, &next_id, "tools/call",
-        serde_json::json!({ "name": tool_name, "arguments": arguments })
-    ).await?;
+    let params = serde_json::json!({ "name": tool_name, "arguments": arguments });
+    let resp = match &handle {
+        Handle::Stdio(stdin, pending, next_id) =>
+            mcp_rpc(stdin, pending, next_id, "tools/call", params).await?,
+        Handle::Http(url, auth, session, next_id) =>
+            mcp_http_rpc(url, auth, session, next_id, "tools/call", params).await?,
+    };
 
     if let Some(err) = resp.get("error") {
         return Err(format!("MCP tool error: {err}"));
@@ -1447,8 +2310,9 @@ async fn mcp_list_servers(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(StreamCancelToken(Arc::new(AtomicBool::new(false))))
+        .manage(StreamCancelMap::new())
         .manage(McpManager::new())
+        .manage(ProcessManager::new())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -1462,11 +2326,19 @@ pub fn run() {
             stat_knowledge_files,
             read_memory,
             save_memory,
+            save_session,
+            read_sessions,
+            delete_session_file,
+            save_session_image,
+            read_session_image,
             read_memory_files,
             save_memory_file,
             save_secret,
             read_secret,
             append_log,
+            launch_self_update,
+            append_telemetry,
+            read_telemetry,
             read_inbox,
             save_inbox,
             ollama_tags,
@@ -1479,9 +2351,17 @@ pub fn run() {
             get_home_dir,
             tool_read_file,
             tool_write_file,
+            tool_edit_file,
+            checkpoint_file,
+            checkpoint_revert,
+            find_project_instructions,
             tool_search_files,
             tool_list_dir,
             tool_run_command,
+            tool_run_background,
+            tool_process_status,
+            tool_process_kill,
+            tool_process_list,
             tool_python_exec,
             tool_git_status,
             tool_git_diff,

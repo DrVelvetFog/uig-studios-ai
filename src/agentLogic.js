@@ -71,13 +71,61 @@ export function validateToolArgs(fnName, fnArgs, allTools) {
   return { valid: true };
 }
 
+// ── Approval diff builder ─────────────────────────────────────────────────────
+// Produces a compact line diff for the tool-approval prompt.
+// edit_file: trims common leading/trailing lines, adds one line of context each side.
+// write_file: renders the (capped) new content as all-added lines.
+// Returns [{ sign: "-"|"+"|" ", text }]. Empty array = nothing to show.
+const DIFF_MAX_LINES = 40;
+
+export function buildEditDiff(oldStr, newStr) {
+  const a = String(oldStr ?? "").split("\n");
+  const b = String(newStr ?? "").split("\n");
+  let start = 0;
+  while (start < a.length && start < b.length && a[start] === b[start]) start++;
+  let endA = a.length, endB = b.length;
+  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) { endA--; endB--; }
+
+  const lines = [];
+  if (start > 0) lines.push({ sign: " ", text: a[start - 1] });
+  for (let i = start; i < endA; i++) lines.push({ sign: "-", text: a[i] });
+  for (let i = start; i < endB; i++) lines.push({ sign: "+", text: b[i] });
+  if (endA < a.length) lines.push({ sign: " ", text: a[endA] });
+
+  if (lines.length > DIFF_MAX_LINES) {
+    const omitted = lines.length - DIFF_MAX_LINES;
+    return [...lines.slice(0, DIFF_MAX_LINES), { sign: " ", text: `… ${omitted} more line${omitted === 1 ? "" : "s"}` }];
+  }
+  return lines;
+}
+
+export function buildWriteDiff(content) {
+  const b = String(content ?? "").split("\n");
+  const lines = b.slice(0, DIFF_MAX_LINES).map(text => ({ sign: "+", text }));
+  if (b.length > DIFF_MAX_LINES) {
+    const omitted = b.length - DIFF_MAX_LINES;
+    lines.push({ sign: " ", text: `… ${omitted} more line${omitted === 1 ? "" : "s"}` });
+  }
+  return lines;
+}
+
+// Builds the diff (or null) shown in the approval prompt for a pending tool call.
+export function approvalDiffFor(name, args = {}) {
+  if (name === "edit_file")  return buildEditDiff(args.old_string, args.new_string);
+  if (name === "write_file") return buildWriteDiff(args.content);
+  return null;
+}
+
 // Adds a contextual hint to raw tool error messages so the model can self-correct.
 export function enrichToolError(fnName, rawError) {
   const e = String(rawError);
   const hints = {
     "read_file":    "Try list_dir on the parent directory first to confirm the path exists.",
     "write_file":   "Ensure the path is under $HOME. The directory will be created automatically.",
-    "run_command":  "Check the exact command syntax. Use list_dir to confirm paths before running.",
+    "edit_file":    "read_file the target first and copy old_string EXACTLY (whitespace included). If it matches multiple places, add surrounding lines to make it unique.",
+    "run_command":  "Check the exact command syntax. Use list_dir to confirm paths before running. For long builds pass timeout_seconds; for servers use run_background.",
+    "run_background": "Check the command syntax. After starting, call process_status with the returned id to confirm it came up.",
+    "process_status": "Use the exact id returned by run_background. Call process_list to see all known process ids.",
     "web_search":   "Try a more specific query or different keywords.",
     "fetch_url":    "The URL may be paywalled or unavailable. Try a different source from the search results.",
     "search_files": "Check that the directory exists and the pattern is valid regex.",
@@ -97,13 +145,49 @@ export function neededSearchButSkipped(userPrompt, toolSteps) {
   return !usedSearch;
 }
 
+// ── Telemetry aggregation ─────────────────────────────────────────────────────
+// Parses telemetry JSONL (one agent run per line) into per-model stats so you
+// can see which local models actually complete agentic work.
+export function aggregateTelemetry(jsonl) {
+  const byModel = new Map();
+  for (const line of String(jsonl || "").split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    let run;
+    try { run = JSON.parse(t); } catch { continue; }
+    if (!run?.model) continue;
+    const m = byModel.get(run.model) || {
+      model: run.model, runs: 0, completed: 0, errors: 0,
+      totalLoops: 0, totalStopRejections: 0, totalDurationS: 0,
+    };
+    m.runs++;
+    if (run.outcome === "complete") m.completed++;
+    if (run.outcome === "error")    m.errors++;
+    m.totalLoops += Number(run.loops) || 0;
+    m.totalStopRejections += Number(run.stopRejections) || 0;
+    m.totalDurationS += Number(run.durationS) || 0;
+    byModel.set(run.model, m);
+  }
+  return [...byModel.values()]
+    .map(m => ({
+      model: m.model,
+      runs: m.runs,
+      completionRate: m.runs ? Math.round((m.completed / m.runs) * 100) : 0,
+      errorRate: m.runs ? Math.round((m.errors / m.runs) * 100) : 0,
+      avgLoops: m.runs ? Math.round((m.totalLoops / m.runs) * 10) / 10 : 0,
+      avgStopRejections: m.runs ? Math.round((m.totalStopRejections / m.runs) * 10) / 10 : 0,
+      avgDurationS: m.runs ? Math.round(m.totalDurationS / m.runs) : 0,
+    }))
+    .sort((a, b) => b.runs - a.runs);
+}
+
 export function evaluateStopCondition(loopToolSteps) {
   // Flatten: direct steps + any subagent sub-steps (nested one level deep)
   const allSteps = loopToolSteps.flatMap(s => [s, ...(s.subSteps || [])]);
 
-  // Did we write any code file?
+  // Did we write or edit any code file?
   const wroteCode = loopToolSteps.some(s => {
-    if (s.name === "write_file") {
+    if (s.name === "write_file" || s.name === "edit_file") {
       const ext = ("." + (s.args?.path || "").split(".").pop()).toLowerCase();
       return CODE_EXTS_SET.has(ext);
     }

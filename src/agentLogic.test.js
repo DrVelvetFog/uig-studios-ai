@@ -5,7 +5,110 @@ import {
   neededSearchButSkipped,
   evaluateStopCondition,
   enrichToolError,
+  buildEditDiff,
+  buildWriteDiff,
+  approvalDiffFor,
+  aggregateTelemetry,
 } from "./agentLogic.js";
+
+describe("aggregateTelemetry", () => {
+  const LINES = [
+    JSON.stringify({ model: "hermes3", outcome: "complete", loops: 4, stopRejections: 1, durationS: 30 }),
+    JSON.stringify({ model: "hermes3", outcome: "answered", loops: 2, stopRejections: 0, durationS: 10 }),
+    JSON.stringify({ model: "hermes3", outcome: "error",    loops: 1, stopRejections: 0, durationS: 5 }),
+    JSON.stringify({ model: "llama3.2", outcome: "complete", loops: 6, stopRejections: 2, durationS: 60 }),
+    "not json at all",
+    "",
+  ].join("\n");
+
+  it("aggregates per model with rates and averages", () => {
+    const stats = aggregateTelemetry(LINES);
+    expect(stats).toHaveLength(2);
+    const h = stats.find(s => s.model === "hermes3");
+    expect(h.runs).toBe(3);
+    expect(h.completionRate).toBe(33);
+    expect(h.errorRate).toBe(33);
+    expect(h.avgLoops).toBeCloseTo(2.3, 1);
+    expect(h.avgDurationS).toBe(15);
+    const l = stats.find(s => s.model === "llama3.2");
+    expect(l.completionRate).toBe(100);
+  });
+
+  it("sorts by run count and survives garbage input", () => {
+    const stats = aggregateTelemetry(LINES);
+    expect(stats[0].model).toBe("hermes3");
+    expect(aggregateTelemetry("")).toEqual([]);
+    expect(aggregateTelemetry(null)).toEqual([]);
+  });
+});
+
+describe("buildEditDiff / approvalDiffFor", () => {
+  it("marks removed lines - and added lines +", () => {
+    const d = buildEditDiff("foo\nbar\nbaz", "foo\nBAR\nbaz");
+    expect(d).toEqual([
+      { sign: " ", text: "foo" },
+      { sign: "-", text: "bar" },
+      { sign: "+", text: "BAR" },
+      { sign: " ", text: "baz" },
+    ]);
+  });
+
+  it("handles pure insertion", () => {
+    const d = buildEditDiff("a\nc", "a\nb\nc");
+    expect(d.filter(l => l.sign === "+").map(l => l.text)).toEqual(["b"]);
+    expect(d.filter(l => l.sign === "-")).toHaveLength(0);
+  });
+
+  it("handles pure deletion", () => {
+    const d = buildEditDiff("a\nb\nc", "a\nc");
+    expect(d.filter(l => l.sign === "-").map(l => l.text)).toEqual(["b"]);
+    expect(d.filter(l => l.sign === "+")).toHaveLength(0);
+  });
+
+  it("caps very long diffs with an omission marker", () => {
+    const oldStr = Array.from({ length: 60 }, (_, i) => `old${i}`).join("\n");
+    const newStr = Array.from({ length: 60 }, (_, i) => `new${i}`).join("\n");
+    const d = buildEditDiff(oldStr, newStr);
+    expect(d.length).toBeLessThanOrEqual(41);
+    expect(d[d.length - 1].text).toMatch(/more line/);
+  });
+
+  it("buildWriteDiff renders content as all-added lines", () => {
+    const d = buildWriteDiff("one\ntwo");
+    expect(d).toEqual([{ sign: "+", text: "one" }, { sign: "+", text: "two" }]);
+  });
+
+  it("approvalDiffFor routes by tool name", () => {
+    expect(approvalDiffFor("edit_file", { old_string: "a", new_string: "b" })
+      .some(l => l.sign === "-")).toBe(true);
+    expect(approvalDiffFor("write_file", { content: "x" })).toEqual([{ sign: "+", text: "x" }]);
+    expect(approvalDiffFor("run_command", { command: "ls" })).toBeNull();
+  });
+});
+
+describe("evaluateStopCondition — edit_file counts as code change", () => {
+  it("blocks stop when a code file was edited but never run", () => {
+    const r = evaluateStopCondition([
+      { name: "edit_file", args: { path: "/tmp/app.py" }, status: "done", result: "Replaced 1 occurrence" },
+    ]);
+    expect(r.canStop).toBe(false);
+  });
+
+  it("allows stop when edited code file ran with exit 0", () => {
+    const r = evaluateStopCondition([
+      { name: "edit_file",   args: { path: "/tmp/app.py" }, status: "done", result: "Replaced 1 occurrence" },
+      { name: "run_command", args: { command: "python3 /tmp/app.py" }, status: "done", result: "ok\n[exit 0]" },
+    ]);
+    expect(r.canStop).toBe(true);
+  });
+
+  it("ignores edit_file on non-code files", () => {
+    const r = evaluateStopCondition([
+      { name: "edit_file", args: { path: "/tmp/notes.md" }, status: "done", result: "Replaced 1 occurrence" },
+    ]);
+    expect(r.canStop).toBe(true);
+  });
+});
 
 const TOOLS = [
   { function: { name: "read_file",  parameters: { required: ["path"], properties: { path: { description: "file path" } } } } },
