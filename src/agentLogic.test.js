@@ -9,7 +9,43 @@ import {
   buildWriteDiff,
   approvalDiffFor,
   aggregateTelemetry,
+  selectSessionsForCleanup,
 } from "./agentLogic.js";
+
+describe("selectSessionsForCleanup", () => {
+  const DAY = 86_400_000;
+  const now = 1_750_000_000_000;
+  const sessions = [
+    { id: now - 40 * DAY, title: "old" },
+    { id: now - 10 * DAY, title: "mid" },
+    { id: now - 1 * DAY,  title: "recent" },
+    { id: now,            title: "active" },
+  ];
+
+  it("selects sessions older than N days, never the active one", () => {
+    expect(selectSessionsForCleanup(sessions, { olderThanDays: 30, keepId: now, now }))
+      .toEqual([now - 40 * DAY]);
+    expect(selectSessionsForCleanup(sessions, { olderThanDays: 7, keepId: now, now }))
+      .toEqual([now - 40 * DAY, now - 10 * DAY]);
+  });
+
+  it("olderThanDays 0 selects everything except the active session", () => {
+    const ids = selectSessionsForCleanup(sessions, { olderThanDays: 0, keepId: now, now });
+    expect(ids).toHaveLength(3);
+    expect(ids).not.toContain(now);
+  });
+
+  it("protects the active session even when it is old", () => {
+    const oldActive = now - 40 * DAY;
+    expect(selectSessionsForCleanup(sessions, { olderThanDays: 30, keepId: oldActive, now }))
+      .toEqual([]);
+  });
+
+  it("handles garbage input", () => {
+    expect(selectSessionsForCleanup(null, { olderThanDays: 7 })).toEqual([]);
+    expect(selectSessionsForCleanup(sessions, {})).toEqual([]);
+  });
+});
 
 describe("aggregateTelemetry", () => {
   const LINES = [

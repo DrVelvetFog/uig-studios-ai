@@ -145,6 +145,21 @@ export function neededSearchButSkipped(userPrompt, toolSteps) {
   return !usedSearch;
 }
 
+// ── Session cleanup selection ─────────────────────────────────────────────────
+// Picks which sessions a bulk-cleanup action should delete. Session ids are
+// Date.now() at creation, so age comes straight from the id.
+//   olderThanDays > 0 → sessions created more than N days ago
+//   olderThanDays === 0 → every session (i.e. "all except current")
+// The active session (keepId) is never selected, and at least one session must
+// survive — the UI guarantees keepId exists, so that invariant holds here.
+export function selectSessionsForCleanup(sessions, { olderThanDays, keepId, now = Date.now() } = {}) {
+  if (!Array.isArray(sessions) || olderThanDays === undefined || olderThanDays === null) return [];
+  const cutoff = now - olderThanDays * 86_400_000;
+  return sessions
+    .filter(s => s && s.id !== keepId && Number(s.id) <= cutoff)
+    .map(s => s.id);
+}
+
 // ── Telemetry aggregation ─────────────────────────────────────────────────────
 // Parses telemetry JSONL (one agent run per line) into per-model stats so you
 // can see which local models actually complete agentic work.

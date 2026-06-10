@@ -4,7 +4,7 @@ use std::sync::{
     Arc,
 };
 use futures_util::StreamExt;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 // ── Per-stream cancel tokens ──────────────────────────────────────────────────
 // One flag per active stream (keyed by event_id) so concurrent sessions can
@@ -284,6 +284,24 @@ fn delete_session_file(id: String) -> Result<(), String> {
         std::fs::remove_file(&path).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Remove all extracted images belonging to a session (files named "<id>_*.png"
+/// in ~/.tonyai/session-images/). Called alongside delete_session_file.
+#[tauri::command]
+fn delete_session_images(id: String) -> Result<u32, String> {
+    if !session_id_ok(&id) { return Err("invalid session id".into()); }
+    let dir = tonyai_dir()?.join("session-images");
+    if !dir.exists() { return Ok(0); }
+    let prefix = format!("{}_", id);
+    let mut removed = 0u32;
+    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(&prefix) && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 /// Save a generated image out of a session into ~/.tonyai/session-images/.
@@ -1767,6 +1785,7 @@ const BG_OUTPUT_CAP: usize = 64_000; // chars kept per process (tail wins)
 
 struct BgProcess {
     command:   String,
+    pid:       u32, // process-group leader (spawned with process_group(0), so pgid == pid)
     output:    Arc<std::sync::Mutex<String>>,
     exit_code: Arc<std::sync::Mutex<Option<i32>>>,
     child:     Arc<TokioMutex<Option<tokio::process::Child>>>,
@@ -1783,6 +1802,110 @@ impl ProcessManager {
     }
 }
 
+// ── Process-group signalling ──────────────────────────────────────────────────
+// Each background command runs as the leader of its own process group, so one
+// signal to -pgid reaches the wrapper shell AND everything it forked (npm
+// scripts, dev-server workers, …) — no surviving grandchildren.
+
+fn signal_group(pid: u32, sig: i32) {
+    if pid == 0 { return; } // never signal our own group
+    unsafe { libc::kill(-(pid as i32), sig); }
+}
+
+async fn kill_group_graceful(pid: u32) {
+    signal_group(pid, libc::SIGTERM);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    signal_group(pid, libc::SIGKILL);
+}
+
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 { return false; }
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// Guard against PID reuse: confirm `pid` is still running (a prefix of) the
+/// command we recorded before treating it as our orphan.
+fn pid_runs_command(pid: u32, command: &str) -> bool {
+    let out = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output();
+    let Ok(out) = out else { return false };
+    let ps_cmd = String::from_utf8_lossy(&out.stdout);
+    let prefix: String = command.chars().take(40).collect();
+    let prefix = prefix.trim();
+    !prefix.is_empty() && ps_cmd.contains(prefix)
+}
+
+// ── Persistent process registry (~/.tonyai/processes.json) ───────────────────
+// Mirror of the in-memory registry, so a restart can find processes the
+// previous instance left running (crash, force-quit) and offer to kill them.
+
+fn proc_registry_path() -> Result<PathBuf, String> {
+    Ok(tonyai_dir()?.join("processes.json"))
+}
+
+fn load_proc_registry() -> StdHashMap<String, serde_json::Value> {
+    proc_registry_path().ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_proc_registry(map: &StdHashMap<String, serde_json::Value>) {
+    if let Ok(p) = proc_registry_path() {
+        let _ = std::fs::write(p, serde_json::to_string(map).unwrap_or_else(|_| "{}".into()));
+    }
+}
+
+fn registry_add(id: &str, pid: u32, command: &str) {
+    let mut map = load_proc_registry();
+    map.insert(id.to_string(), serde_json::json!({
+        "pid": pid,
+        "command": command,
+        "started_epoch": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+    }));
+    save_proc_registry(&map);
+}
+
+fn registry_remove(id: &str) {
+    let mut map = load_proc_registry();
+    if map.remove(id).is_some() {
+        save_proc_registry(&map);
+    }
+}
+
+/// Called once at JS bootstrap: prune dead registry entries, return live
+/// orphans (processes a previous app instance started and never killed).
+#[tauri::command]
+fn reconcile_orphan_processes() -> Result<String, String> {
+    let map = load_proc_registry();
+    let mut kept = StdHashMap::new();
+    let mut orphans = Vec::new();
+    for (id, v) in map {
+        let pid = v.get("pid").and_then(|p| p.as_u64()).unwrap_or(0) as u32;
+        let command = v.get("command").and_then(|c| c.as_str()).unwrap_or("").to_string();
+        if pid_alive(pid) && pid_runs_command(pid, &command) {
+            orphans.push(serde_json::json!({
+                "id": id, "pid": pid, "command": command,
+                "started_epoch": v.get("started_epoch").cloned().unwrap_or(serde_json::json!(0)),
+            }));
+            kept.insert(id, v);
+        }
+        // dead or reused pid → drop from the registry
+    }
+    save_proc_registry(&kept);
+    serde_json::to_string(&orphans).map_err(|e| e.to_string())
+}
+
+/// Kill an orphan from a previous app instance (whole process group).
+#[tauri::command]
+async fn kill_orphan_process(id: String, pid: u32) -> Result<String, String> {
+    kill_group_graceful(pid).await;
+    registry_remove(&id);
+    Ok(format!("Killed orphan {} (pgid {})", id, pid))
+}
+
 fn bg_append(buf: &Arc<std::sync::Mutex<String>>, line: &str) {
     if let Ok(mut s) = buf.lock() {
         s.push_str(line);
@@ -1797,13 +1920,41 @@ fn bg_append(buf: &Arc<std::sync::Mutex<String>>, line: &str) {
 }
 
 /// Update exit_code from the child if it has exited (reaps the process).
-async fn bg_refresh_exit(p: &BgProcess) {
+/// `id` lets us drop naturally-exited processes from the persistent registry —
+/// they can no longer become orphans.
+async fn bg_refresh_exit(id: &str, p: &BgProcess) {
     let mut guard = p.child.lock().await;
     if let Some(child) = guard.as_mut() {
         if let Ok(Some(status)) = child.try_wait() {
             *p.exit_code.lock().unwrap() = Some(status.code().unwrap_or(-1));
             *guard = None; // reaped — drop the handle
+            registry_remove(id);
         }
+    }
+}
+
+#[cfg(test)]
+mod proc_registry_tests {
+    use super::*;
+
+    // Single test — the registry is one shared file, so parallel test
+    // functions would race each other's load-modify-save cycles.
+    #[test]
+    fn registry_roundtrip_and_reconcile() {
+        // Add/remove roundtrip
+        let rt = format!("bg_rt_{}", std::process::id());
+        registry_add(&rt, 12345, "echo hi");
+        assert!(load_proc_registry().contains_key(&rt));
+        registry_remove(&rt);
+        assert!(!load_proc_registry().contains_key(&rt));
+
+        // pid 1 = launchd: alive but running a different command → must be
+        // pruned as a PID-reuse mismatch, never reported as our orphan.
+        let id = format!("bg_test_{}", std::process::id());
+        registry_add(&id, 1, "definitely-not-a-real-tonyai-command-xyz");
+        let orphans = reconcile_orphan_processes().unwrap();
+        assert!(!orphans.contains(&id), "mismatched pid must not be an orphan: {orphans}");
+        assert!(!load_proc_registry().contains_key(&id), "entry must be pruned");
     }
 }
 
@@ -1813,17 +1964,21 @@ async fn tool_run_background(
     state: tauri::State<'_, ProcessManager>,
     command: String,
 ) -> Result<String, String> {
-    let mut child = tokio::process::Command::new("sh")
-        .arg("-c")
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c")
         .arg(&command)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to start: {}", e))?;
+        .stderr(std::process::Stdio::piped());
+    // Own process group: pgid == child pid, so a group signal reaches every fork
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to start: {}", e))?;
+    let pid = child.id().unwrap_or(0);
 
     let id = format!("bg_{}", std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis());
+    registry_add(&id, pid, &command);
     let output: Arc<std::sync::Mutex<String>> = Arc::new(std::sync::Mutex::new(String::new()));
 
     // Reader tasks — stream stdout/stderr lines into the capped buffer
@@ -1844,6 +1999,7 @@ async fn tool_run_background(
 
     state.procs.lock().await.insert(id.clone(), BgProcess {
         command: command.clone(),
+        pid,
         output,
         exit_code: Arc::new(std::sync::Mutex::new(None)),
         child: Arc::new(TokioMutex::new(Some(child))),
@@ -1865,7 +2021,7 @@ async fn tool_process_status(
 ) -> Result<String, String> {
     let procs = state.procs.lock().await;
     let p = procs.get(&id).ok_or_else(|| format!("No such process: {}", id))?;
-    bg_refresh_exit(p).await;
+    bg_refresh_exit(&id, p).await;
 
     let exit = *p.exit_code.lock().unwrap();
     let out  = p.output.lock().unwrap().clone();
@@ -1891,16 +2047,19 @@ async fn tool_process_kill(
 ) -> Result<String, String> {
     let mut procs = state.procs.lock().await;
     let p = procs.get(&id).ok_or_else(|| format!("No such process: {}", id))?;
+    let pid = p.pid;
     let mut guard = p.child.lock().await;
     let was_running = if let Some(child) = guard.as_mut() {
-        let _ = child.start_kill();
-        let _ = child.wait().await; // reap
+        // Signal the whole group so forked grandchildren die too, then reap.
+        kill_group_graceful(pid).await;
+        let _ = child.wait().await;
         true
     } else { false };
     drop(guard);
     procs.remove(&id);
+    registry_remove(&id);
     Ok(if was_running {
-        format!("Killed {}", id)
+        format!("Killed {} (process group {})", id, pid)
     } else {
         format!("{} had already exited — removed from registry", id)
     })
@@ -1914,7 +2073,7 @@ async fn tool_process_list(
     let procs = state.procs.lock().await;
     let mut items = Vec::new();
     for (id, p) in procs.iter() {
-        bg_refresh_exit(p).await;
+        bg_refresh_exit(id, p).await;
         let exit = *p.exit_code.lock().unwrap();
         items.push(serde_json::json!({
             "id": id,
@@ -2329,6 +2488,7 @@ pub fn run() {
             save_session,
             read_sessions,
             delete_session_file,
+            delete_session_images,
             save_session_image,
             read_session_image,
             read_memory_files,
@@ -2362,6 +2522,8 @@ pub fn run() {
             tool_process_status,
             tool_process_kill,
             tool_process_list,
+            reconcile_orphan_processes,
+            kill_orphan_process,
             tool_python_exec,
             tool_git_status,
             tool_git_diff,
@@ -2374,6 +2536,29 @@ pub fn run() {
             mcp_stop_server,
             mcp_list_servers,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Kill every background process group on normal app exit so dev
+            // servers and watch tasks don't outlive TonyAI. (Force-quit/crash
+            // is covered by the persistent registry + orphan reconciliation.)
+            if let tauri::RunEvent::Exit = event {
+                if let Some(pm) = app_handle.try_state::<ProcessManager>() {
+                    tauri::async_runtime::block_on(async {
+                        let mut procs = pm.procs.lock().await;
+                        for (id, p) in procs.iter() {
+                            signal_group(p.pid, libc::SIGTERM);
+                            registry_remove(id);
+                        }
+                        if !procs.is_empty() {
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            for p in procs.values() {
+                                signal_group(p.pid, libc::SIGKILL);
+                            }
+                        }
+                        procs.clear();
+                    });
+                }
+            }
+        });
 }

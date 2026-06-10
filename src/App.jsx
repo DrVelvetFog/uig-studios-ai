@@ -5,7 +5,7 @@ import { fetch } from "@tauri-apps/plugin-http";   // kept for A1111 / ComfyUI o
 import mascot from "./assets/mascot.png";
 import { classifyPrompt } from "./classifyPrompt.js";
 import { isMutatingTool, guardToolCall, toolApprovalDetail, wrapUntrustedContent, suggestAllowPattern, isAllowlisted } from "./toolGuard.js";
-import { CODE_EXTS_SET, extractToolCallFromText, validateToolArgs, enrichToolError, neededSearchButSkipped, evaluateStopCondition, approvalDiffFor, aggregateTelemetry } from "./agentLogic.js";
+import { CODE_EXTS_SET, extractToolCallFromText, validateToolArgs, enrichToolError, neededSearchButSkipped, evaluateStopCondition, approvalDiffFor, aggregateTelemetry, selectSessionsForCleanup } from "./agentLogic.js";
 import { installGlobalErrorLogging, logError } from "./logger.js";
 import { renderMessage, TypingDots } from "./render.jsx";
 import { DevInspectPanel } from "./components/DevInspectPanel.jsx";
@@ -1669,10 +1669,37 @@ export default function App() {
       const next = prev.filter(s => s.id !== id);
       persistSessions(next);
       invoke("delete_session_file", { id: String(id) }).catch(() => {});
+      invoke("delete_session_images", { id: String(id) }).catch(() => {});
       lastWrittenJson.delete(id);
       if (activeId === id) { setActiveId(next[next.length-1].id); persistActive(next[next.length-1].id); }
       return next;
     });
+  }
+
+  // ── Bulk chat cleanup ─────────────────────────────────────────────────────
+  // cleanupConfirm: null | { days, count } — second click executes
+  const [showCleanup, setShowCleanup]       = useState(false);
+  const [cleanupConfirm, setCleanupConfirm] = useState(null);
+
+  function cleanupCount(days) {
+    return selectSessionsForCleanup(sessions, { olderThanDays: days, keepId: activeId }).length;
+  }
+
+  function runCleanup(days) {
+    const ids = new Set(selectSessionsForCleanup(sessions, { olderThanDays: days, keepId: activeId }));
+    if (ids.size === 0) { setCleanupConfirm(null); return; }
+    setSessions(prev => {
+      const next = prev.filter(s => !ids.has(s.id));
+      for (const id of ids) {
+        invoke("delete_session_file",   { id: String(id) }).catch(() => {});
+        invoke("delete_session_images", { id: String(id) }).catch(() => {});
+        lastWrittenJson.delete(id);
+      }
+      persistSessions(next);
+      return next;
+    });
+    setCleanupConfirm(null);
+    setShowCleanup(false);
   }
 
   function forkSession(id, e) {
@@ -1741,6 +1768,9 @@ export default function App() {
   const [inbox, setInbox]               = useState([]);
   // Background processes started via run_background — [{id, command, status, exit_code, elapsed_s}]
   const [bgProcs, setBgProcs]           = useState([]);
+  // Live processes left behind by a PREVIOUS app instance (crash / force-quit),
+  // found via the persistent registry at startup — [{id, pid, command}]
+  const [orphanProcs, setOrphanProcs]   = useState([]);
   const [compactNotice, setCompactNotice] = useState("");
   const [confirmCmds, setConfirmCmds] = useState(() => localStorage.getItem("tonyai-confirm-cmds") !== "false");
   const [pendingCmd,  setPendingCmd]   = useState(null); // null | { name, detail, diff, allowSuggestion } — awaiting user approval
@@ -2442,6 +2472,11 @@ export default function App() {
     } catch { setOllamaOk(false); }
     // Load monitor inbox
     try { setInbox(JSON.parse(await invoke("read_inbox"))); } catch {}
+    // Surface background processes a previous app instance left running
+    try {
+      const orphans = JSON.parse(await invoke("reconcile_orphan_processes"));
+      if (orphans.length) setOrphanProcs(orphans);
+    } catch {}
     try { const r=await fetch(`${A1111_URL}/sdapi/v1/options`); setBknd(p=>({...p,a1111:r.ok?"online":"offline"})); } catch { setBknd(p=>({...p,a1111:"offline"})); }
     try {
       const r=await fetch(`${COMFY_URL}/system_stats`);
@@ -2648,6 +2683,10 @@ export default function App() {
   async function killBgProc(id) {
     try { await invoke("tool_process_kill", { id }); } catch {}
     refreshBgProcs();
+  }
+  async function killOrphan(o) {
+    try { await invoke("kill_orphan_process", { id: o.id, pid: o.pid }); } catch {}
+    setOrphanProcs(prev => prev.filter(x => x.id !== o.id));
   }
 
   // While any background process exists, poll its status every 10s so the
@@ -3799,6 +3838,41 @@ After getting results, give your final answer in normal markdown. Never include 
             })()}
           </div>
 
+          {/* Chat cleanup — bulk-delete old conversations */}
+          <div style={{ padding:"4px 10px 2px", flexShrink:0 }}>
+            <button onClick={()=>{ setShowCleanup(p=>!p); setCleanupConfirm(null); }}
+              style={{ background:"none", border:"none", color:"var(--tny-tx5)", cursor:"pointer", fontSize:10, fontFamily:"inherit", padding:"2px 4px", letterSpacing:"0.04em" }}>
+              🧹 Clean up chats {showCleanup ? "▴" : "▾"}
+            </button>
+            {showCleanup && (
+              <div style={{ display:"flex", flexDirection:"column", gap:4, padding:"4px 4px 6px" }}>
+                {[
+                  { days: 30, label: "Older than 30 days" },
+                  { days: 7,  label: "Older than 7 days" },
+                  { days: 0,  label: "All except current" },
+                ].map(opt => {
+                  const count = cleanupCount(opt.days);
+                  const confirming = cleanupConfirm?.days === opt.days;
+                  return (
+                    <button key={opt.days} disabled={count === 0}
+                      onClick={()=> confirming ? runCleanup(opt.days) : setCleanupConfirm({ days: opt.days, count })}
+                      style={{ textAlign:"left", background: confirming ? "rgba(239,68,68,0.10)" : "none",
+                        border:`1px solid ${confirming ? "rgba(239,68,68,0.4)" : "var(--tny-line2)"}`,
+                        color: count === 0 ? "var(--tny-tx5)" : confirming ? "#ef4444" : "var(--tny-tx4)",
+                        cursor: count === 0 ? "default" : "pointer", borderRadius:6, padding:"4px 8px", fontSize:10.5, fontFamily:"inherit" }}>
+                      {confirming
+                        ? `⚠ Delete ${count} chat${count === 1 ? "" : "s"} permanently? Click again`
+                        : `${opt.label} (${count})`}
+                    </button>
+                  );
+                })}
+                <span style={{ fontSize:9, color:"var(--tny-tx5)", padding:"0 2px" }}>
+                  Deletes transcripts + saved images. The current chat is always kept.
+                </span>
+              </div>
+            )}
+          </div>
+
           {/* Image settings — only when image mode */}
           {mode==="image" && (
             <ImageSettings settings={imgSettings} onChange={updImg} backendStatus={backendStatus} checkpoints={comfyCheckpoints}/>
@@ -4436,9 +4510,19 @@ After getting results, give your final answer in normal markdown. Never include 
         </div>
 
         {/* background processes strip */}
-        {bgProcs.length > 0 && (
+        {(bgProcs.length > 0 || orphanProcs.length > 0) && (
           <div style={{ padding:"6px 18px", background:"rgba(56,189,248,0.05)", borderTop:"1px solid rgba(56,189,248,0.18)", display:"flex", alignItems:"center", gap:8, flexWrap:"wrap", flexShrink:0 }}>
             <span style={{ fontSize:10, color:"var(--tny-tx5)", textTransform:"uppercase", letterSpacing:"0.06em", flexShrink:0 }}>🔄 Background</span>
+            {orphanProcs.map(o => (
+              <div key={o.id} style={{ display:"flex", alignItems:"center", gap:6, background:"var(--tny-code)", border:"1px solid rgba(234,179,8,0.4)", borderRadius:6, padding:"2px 8px", fontSize:10.5, fontFamily:"'JetBrains Mono',monospace" }}
+                title={`Still running from a previous TonyAI session (pid ${o.pid})`}>
+                <span style={{ width:6, height:6, borderRadius:"50%", background:"#eab308", flexShrink:0 }}/>
+                <span style={{ color:"#eab308", flexShrink:0 }}>orphan</span>
+                <span style={{ color:"var(--tny-tx3)", maxWidth:220, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{o.command}</span>
+                <button onClick={()=>killOrphan(o)} title="Kill orphaned process"
+                  style={{ background:"none", border:"none", color:"#ef4444", cursor:"pointer", fontSize:11, padding:0, lineHeight:1 }}>■</button>
+              </div>
+            ))}
             {bgProcs.map(p => (
               <div key={p.id} style={{ display:"flex", alignItems:"center", gap:6, background:"var(--tny-code)", border:`1px solid ${p.status==="running"?"rgba(56,189,248,0.3)":"var(--tny-line2)"}`, borderRadius:6, padding:"2px 8px", fontSize:10.5, fontFamily:"'JetBrains Mono',monospace" }}>
                 <span style={{ width:6, height:6, borderRadius:"50%", background:p.status==="running"?"#38bdf8":p.exit_code===0?"#22c55e":"#ef4444", flexShrink:0 }}/>
