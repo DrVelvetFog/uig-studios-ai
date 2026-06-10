@@ -55,9 +55,10 @@ const IMAGE_BACKENDS = [
 
 // temperature + context window defaults per mode
 // Context windows raised to match what installed models actually support.
-// hermes3, devstral, deepseek-r1, qwen2.5-coder, llama3.2 all support 32K–128K natively.
-// 32K is the conservative safe floor; agent gets 64K for long multi-step tasks.
-// Compaction triggers at 70% so effective working space = ~22K / ~45K respectively.
+// hermes3, deepseek-r1, qwen2.5-coder, llama3.2 all support 32K–128K natively.
+// 32K everywhere on this 16GB machine: a 14B model's KV cache at 64K pushes
+// total memory past what the M1 has, and swapping costs far more than the
+// extra context buys. Compaction triggers at 70% → ~22K effective workspace.
 const MODE_DEFAULTS = {
   auto:   { temperature: 0.5, numCtx: 32768 },
   chat:   { temperature: 0.7, numCtx: 32768 },
@@ -66,22 +67,28 @@ const MODE_DEFAULTS = {
   arb:    { temperature: 0.1, numCtx: 32768 },
   python: { temperature: 0.2, numCtx: 32768 },
   image:  { temperature: 0.7, numCtx: 4096 },
-  agent:  { temperature: 0.3, numCtx: 65536 },
+  agent:  { temperature: 0.3, numCtx: 32768 },
 };
 
 // ── Tiered model routing ──────────────────────────────────────────────────────
 // Priority-ordered lists of model-name fragments for each mode.
 // pickModelForMode() walks the list and returns the first installed match.
+//
+// Ordering is grounded in measurement on this 16GB M1 (2026-06-10):
+//   qwen2.5-coder:14b / 14B class ≈ 6+ tok/s — best quality that runs well
+//   hermes3 8B — fast fallback
+//   devstral:24b — 0.1 tok/s here (swaps to death); DEMOTED to last resort.
+//     If you ever move to a 32GB+ machine, promote it back.
 const MODEL_TIERS = {
   // Vision models (llama3.2-vision, moondream) are skipped for text-only modes
   // by pickModelForMode's first pass — they appear here only as last-resort fallbacks.
   chat:   ["llama3.2", "llama3.1", "llama3", "gemma3", "gemma2", "qwen2.5", "mistral", "phi"],
-  code:   ["devstral", "hermes3", "codellama", "deepseek-coder", "qwen2.5-coder", "llama3.1", "llama3.2"],
-  sui:    ["devstral", "hermes3", "deepseek-r1", "llama3.1", "llama3.2", "mistral"],
-  arb:    ["devstral", "hermes3", "deepseek-r1", "llama3.1", "llama3.2", "mistral"],
-  python: ["devstral", "hermes3", "codellama", "deepseek-coder", "qwen2.5-coder", "llama3.1", "llama3.2"],
-  agent:  ["hermes3", "devstral", "llama3.1", "llama3.2", "gemma2", "mistral"],
-  auto:   ["hermes3", "devstral", "llama3.1", "llama3.2", "gemma2"],
+  code:   ["qwen2.5-coder", "hermes3", "codellama", "deepseek-coder", "llama3.1", "llama3.2", "devstral"],
+  sui:    ["qwen2.5-coder", "hermes3", "deepseek-r1", "llama3.1", "llama3.2", "mistral", "devstral"],
+  arb:    ["qwen2.5-coder", "hermes3", "deepseek-r1", "llama3.1", "llama3.2", "mistral", "devstral"],
+  python: ["qwen2.5-coder", "hermes3", "codellama", "deepseek-coder", "llama3.1", "llama3.2", "devstral"],
+  agent:  ["qwen2.5-coder", "hermes3", "llama3.1", "llama3.2", "gemma2", "mistral", "devstral"],
+  auto:   ["qwen2.5-coder", "hermes3", "llama3.1", "llama3.2", "gemma2", "devstral"],
   // image tier: vision-capable models for analysis/description (generation uses A1111/ComfyUI)
   image:  ["llama3.2-vision", "moondream", "llama3.2", "llama3.1"],
 };
@@ -1209,8 +1216,9 @@ async function runSubagent({ role, task, model, signal, braveApiKey, onProgress,
       usePromptTools = true; loopCount--; continue;
     }
 
-    // Prompt-mode: robust tool call extraction (handles embedded JSON, multiple key names)
-    if (usePromptTools && !toolCalls.length) {
+    // Tool-call extraction from text — prompt mode always; native mode too when
+    // the whole reply is a bare JSON object (qwen2.5-coder does this).
+    if (!toolCalls.length && (usePromptTools || content.trim().startsWith("{"))) {
       const extracted = extractToolCallFromText(content);
       if (extracted) toolCalls = extracted;
     }
@@ -2735,6 +2743,15 @@ export default function App() {
       ? pickModelForMode(effectiveMode, models, model)
       : model;
 
+    // Memory-aware context clamp: a 14B model's KV cache at 32K (~6GB) plus
+    // ~9GB of weights exceeds this machine's 16GB unified memory and generation
+    // collapses into swap (measured 0.5 tok/s at 32K vs 5.5 tok/s at 16K).
+    // Models ≥8GB on disk get a 16K window; smaller models keep the mode default.
+    const modelBytes = modelMeta[activeModel]?.size || 0;
+    const effectiveNumCtx = modelBytes >= 8e9
+      ? Math.min(modelSettings.numCtx, 16384)
+      : modelSettings.numCtx;
+
     if (effectiveMode==="image") {
       const id = Date.now();
       setMessages(prev=>[...prev,
@@ -2910,7 +2927,7 @@ MEMORY: If you learn a user preference, project constraint, correction, or recur
       {
         const KEEP_RECENT = 8; // always keep the N most recent messages verbatim
         const estTokens = estimateTokens(sys, ...ollamaHistory.map(m => m.content));
-        const ctxLimit  = modelSettings.numCtx;
+        const ctxLimit  = effectiveNumCtx;
 
         if (estTokens > ctxLimit * 0.70 && ollamaHistory.length > KEEP_RECENT + 2) {
           const older  = ollamaHistory.slice(0, ollamaHistory.length - KEEP_RECENT);
@@ -3029,7 +3046,7 @@ After getting results, give your final answer in normal markdown. Never include 
               messages: loopMsgs,
               stream: true,
               ...(usePromptTools ? {} : { tools: modeToolSet }),
-              options: { temperature: modelSettings.temperature, num_ctx: modelSettings.numCtx },
+              options: { temperature: modelSettings.temperature, num_ctx: effectiveNumCtx },
             };
 
             const eventId = (Date.now() + loopCount).toString();
@@ -3116,8 +3133,13 @@ After getting results, give your final answer in normal markdown. Never include 
               });
             }
 
-            // Prompt-based: robust tool call extraction (handles embedded JSON, multiple key conventions)
-            if (usePromptTools && !toolCalls) {
+            // Tool-call extraction from text content:
+            //  - prompt mode: always (that's the protocol)
+            //  - native mode: some models (qwen2.5-coder) emit the call as a bare
+            //    JSON object in content instead of structured tool_calls — when
+            //    the entire reply is a JSON object, treat it as a tool call
+            //    rather than rendering JSON as the final answer.
+            if (!toolCalls && (usePromptTools || streamText.trim().startsWith("{"))) {
               const extracted = extractToolCallFromText(streamText);
               if (extracted) toolCalls = extracted;
             }
@@ -3554,7 +3576,7 @@ After getting results, give your final answer in normal markdown. Never include 
             // Older messages get their content snipped (L1) or LLM-summarized (L2).
             {
               const KEEP_AGENT = 6;
-              const ctxLimit   = modelSettings.numCtx;
+              const ctxLimit   = effectiveNumCtx;
               const estToks    = estimateTokens(...ollamaMsgs.map(m => m.content || ""));
 
               if (estToks > ctxLimit * 0.70 && ollamaMsgs.length > KEEP_AGENT + 2) {
@@ -3655,7 +3677,7 @@ After getting results, give your final answer in normal markdown. Never include 
         stream:true,
         options: {
           temperature: modelSettings.temperature,
-          num_ctx: modelSettings.numCtx,
+          num_ctx: effectiveNumCtx,
         },
       };
       console.log("[TonyAI] sending to Ollama, model:", activeModel, smartRoute && activeModel !== model ? `(smart-routed from ${model})` : "", "msgs:", reqBody.messages.length);
