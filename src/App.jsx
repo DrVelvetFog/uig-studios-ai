@@ -7,9 +7,13 @@ import { classifyPrompt } from "./classifyPrompt.js";
 import { isMutatingTool, guardToolCall, toolApprovalDetail, wrapUntrustedContent, suggestAllowPattern, isAllowlisted } from "./toolGuard.js";
 import { CODE_EXTS_SET, extractToolCallFromText, validateToolArgs, enrichToolError, neededSearchButSkipped, evaluateStopCondition, approvalDiffFor, aggregateTelemetry, selectSessionsForCleanup } from "./agentLogic.js";
 import { installGlobalErrorLogging, logError } from "./logger.js";
+import { hybridRetrieve } from "./retrieval.js";
+import { modelFit, FIT_DOT } from "./modelFit.js";
+import { isCloudModel, cloudProvider, cloudModelId, cloudDisplayName, toOpenAIBody } from "./cloud.js";
 import { renderMessage, TypingDots } from "./render.jsx";
 import { DevInspectPanel } from "./components/DevInspectPanel.jsx";
 import { InboxPanel } from "./components/InboxPanel.jsx";
+import { ComparePanel } from "./components/ComparePanel.jsx";
 
 // ── Theme bootstrap — runs at module load, before React mounts ────────────────
 // Applies data-theme immediately so CSS variables are correct on first paint.
@@ -628,14 +632,33 @@ const LIGHT_ACCENTS = { auto:"#6b4fbf", chat:"#2563eb", code:"#6b4fbf", sui:"#7c
 // ── Auto-router ───────────────────────────────────────────────────────────────
 // classifyPrompt imported from ./classifyPrompt.js
 
-// ── RAG ──────────────────────────────────────────────────────────────────────
-function cosineSim(a, b) {
-  let dot = 0, na = 0, nb = 0;
-  for (let i = 0; i < a.length; i++) { dot += a[i]*b[i]; na += a[i]*a[i]; nb += b[i]*b[i]; }
-  const denom = Math.sqrt(na) * Math.sqrt(nb);
-  return denom === 0 ? 0 : dot / denom;
+// ── Provider-agnostic non-streaming completion ───────────────────────────────
+// Routes by model id: local models → Ollama, "or/"/"oai/" models → cloud.
+// Returns the Ollama-shaped response { message: { content, tool_calls? } } so
+// callers (subagents, compaction summaries) don't care which provider ran it.
+async function chatOnce(model, messages, tools, options) {
+  if (isCloudModel(model)) {
+    const body = toOpenAIBody({
+      model: cloudModelId(model),
+      messages,
+      tools: tools?.length ? tools : undefined,
+      temperature: options?.temperature,
+      stream: false,
+    }, cloudProvider(model));
+    return JSON.parse(await invoke("cloud_post", {
+      provider: cloudProvider(model),
+      body: JSON.stringify(body),
+    }));
+  }
+  const raw = await invoke("ollama_post", {
+    path: "/api/chat",
+    body: JSON.stringify({ model, messages, stream: false, ...(tools?.length ? { tools } : {}), options }),
+  });
+  return JSON.parse(raw);
 }
 
+// ── RAG ──────────────────────────────────────────────────────────────────────
+// Retrieval is hybrid (vector + keyword, RRF-fused) — see ./retrieval.js.
 async function embedQuery(query) {
   const raw = await invoke("ollama_post", {
     path: "/api/embed",
@@ -644,13 +667,6 @@ async function embedQuery(query) {
   const data = JSON.parse(raw);
   if (!data.embeddings) throw new Error(`embed failed: ${raw}`);
   return data.embeddings[0];
-}
-
-function retrieveChunks(ragIndex, queryEmbedding, topK = 4) {
-  return ragIndex.chunks
-    .map(c => ({ ...c, score: cosineSim(queryEmbedding, c.embedding) }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, topK);
 }
 
 function formatRagContext(chunks) {
@@ -1186,17 +1202,13 @@ async function runSubagent({ role, task, model, signal, braveApiKey, onProgress,
       ? [{ role:"system", content: subMsgs[0].content + PROMPT_FALLBACK }, ...subMsgs.slice(1)]
       : subMsgs;
 
-    const body = {
-      model,
-      messages: msgs,
-      stream: false,
-      ...(usePromptTools ? {} : { tools: getTools() }),
-      options: { temperature: 0.2, num_ctx: 16384 },
-    };
-
-    let raw;
+    let resp;
     try {
-      raw = await invoke("ollama_post", { path: "/api/chat", body: JSON.stringify(body) });
+      resp = await chatOnce(
+        model, msgs,
+        usePromptTools ? null : getTools(),
+        { temperature: 0.2, num_ctx: 16384 },
+      );
     } catch(e) {
       const msg = String(e);
       if (msg.toLowerCase().includes("does not support tools") && !usePromptTools) {
@@ -1205,7 +1217,6 @@ async function runSubagent({ role, task, model, signal, braveApiKey, onProgress,
       throw new Error(`Subagent LLM error: ${msg}`);
     }
 
-    const resp    = JSON.parse(raw);
     const content = resp.message?.content || "";
     let toolCalls = resp.message?.tool_calls || [];
     if (content.trim()) lastContent = content;   // remember for salvage if we hit the cap
@@ -1769,9 +1780,15 @@ export default function App() {
   const [imgSettings, setImgSettings] = useState({ backend:"a1111", size:"512×512", steps:20, cfg:7, negPrompt:"blurry, deformed, ugly, bad anatomy", comfyCheckpoint:"" });
   const [comfyCheckpoints, setComfyCheckpoints] = useState([]); // populated when ComfyUI is online
   const [braveApiKey, setBraveApiKey] = useState("");   // loaded from Rust secret store on mount (see effect below)
+  // Cloud provider keys — same 0600 secret store, never localStorage
+  const [openrouterKey, setOpenrouterKey] = useState("");
+  const [openaiKey, setOpenaiKey]         = useState("");
+  const [cloudModels, setCloudModels]     = useState([]); // prefixed ids: "or/…", "oai/…"
+  const [sessionCost, setSessionCost]     = useState(0);  // USD spent on cloud this app session
   const secretsLoadedRef = useRef(false);
   const [smartRoute, setSmartRoute] = useState(() => localStorage.getItem("tonyai-smart-route") !== "false");
   const [showAgentPanel, setAgentPanel] = useState(false);
+  const [showCompare, setShowCompare]   = useState(false);
   const [showInbox, setShowInbox]       = useState(false);
   const [inbox, setInbox]               = useState([]);
   // Background processes started via run_background — [{id, command, status, exit_code, elapsed_s}]
@@ -1813,6 +1830,7 @@ export default function App() {
   });
   useEffect(() => { localStorage.setItem("tonyai-approval-allowlist", JSON.stringify(approvalAllowlist)); }, [approvalAllowlist]);
   const [homeDir, setHomeDir] = useState("/Users/tonyjagodka"); // populated from Rust at bootstrap
+  const [ramBytes, setRamBytes] = useState(0); // total RAM — for model-fit estimation
   // MCP server configurations (persisted to localStorage)
   const [mcpServers, setMcpServers] = useState(() => {
     try { return JSON.parse(localStorage.getItem("tonyai-mcp-servers") || "[]"); } catch { return []; }
@@ -1862,6 +1880,10 @@ export default function App() {
         }
         localStorage.removeItem("tonyai-brave-key");   // never keep the secret in localStorage
         if (v) setBraveApiKey(v);
+        const orK = await invoke("read_secret", { key: "openrouter" });
+        if (orK) setOpenrouterKey(orK);
+        const oaK = await invoke("read_secret", { key: "openai" });
+        if (oaK) setOpenaiKey(oaK);
       } catch (e) { logError("secret load failed", String(e)); }
       secretsLoadedRef.current = true;
     })();
@@ -1873,6 +1895,45 @@ export default function App() {
     if (!secretsLoadedRef.current) return;
     invoke("save_secret", { key: "brave", value: braveApiKey }).catch(e => logError("secret save failed", String(e)));
   }, [braveApiKey]);
+  useEffect(() => {
+    if (!secretsLoadedRef.current) return;
+    invoke("save_secret", { key: "openrouter", value: openrouterKey }).catch(e => logError("secret save failed", String(e)));
+  }, [openrouterKey]);
+  useEffect(() => {
+    if (!secretsLoadedRef.current) return;
+    invoke("save_secret", { key: "openai", value: openaiKey }).catch(e => logError("secret save failed", String(e)));
+  }, [openaiKey]);
+
+  // Curated cloud model list — refreshed when keys change (debounced so
+  // half-typed keys don't fire requests)
+  async function refreshCloudModels() {
+    const next = [];
+    if (openrouterKey.trim()) {
+      try {
+        const ids = JSON.parse(await invoke("cloud_list_models", { provider: "openrouter" }));
+        const CURATE = /^(anthropic\/claude|openai\/gpt|openai\/o\d|google\/gemini|deepseek\/)/;
+        next.push(...ids
+          .filter(id => CURATE.test(id) && !id.includes(":free") && !/(audio|realtime|image)/.test(id))
+          .sort().slice(0, 40)
+          .map(id => "or/" + id));
+      } catch (e) { logError("openrouter models", String(e)); }
+    }
+    if (openaiKey.trim()) {
+      try {
+        const ids = JSON.parse(await invoke("cloud_list_models", { provider: "openai" }));
+        next.push(...ids
+          .filter(id => /^(gpt-|o\d)/.test(id) && !/(audio|realtime|tts|image|embed|whisper|moderation|transcribe|search)/.test(id))
+          .sort().slice(0, 20)
+          .map(id => "oai/" + id));
+      } catch (e) { logError("openai models", String(e)); }
+    }
+    setCloudModels(next);
+  }
+  useEffect(() => {
+    if (!secretsLoadedRef.current) return;
+    const t = setTimeout(refreshCloudModels, 800);
+    return () => clearTimeout(t);
+  }, [openrouterKey, openaiKey]);
   useEffect(() => { localStorage.setItem("tonyai-smart-route", smartRoute); }, [smartRoute]);
   useEffect(() => { localStorage.setItem("tonyai-confirm-cmds", confirmCmds); }, [confirmCmds]);
   useEffect(() => { localStorage.setItem("tonyai-rag-dir", ragSourceDir); }, [ragSourceDir]);
@@ -2369,6 +2430,11 @@ export default function App() {
   async function bootstrap() {
     // Fetch home directory from Rust (avoids hardcoded usernames)
     try { const h = await invoke("get_home_dir"); if (h) setHomeDir(h); } catch {}
+    // Hardware facts → model-fit dots + context clamping
+    try {
+      const hw = JSON.parse(await invoke("get_hardware_info"));
+      if (hw.ram_bytes) setRamBytes(hw.ram_bytes);
+    } catch {}
 
     // Hydrate sessions from the disk store (migrating any legacy localStorage copy)
     try {
@@ -2738,19 +2804,26 @@ export default function App() {
     // Auto-routing: classify the prompt, pick the best mode's behavior
     const effectiveMode = mode === "auto" ? classifyPrompt(prompt) : mode;
 
-    // Tiered model routing: when smart-route is on, pick best installed model for this task
-    const activeModel = smartRoute
-      ? pickModelForMode(effectiveMode, models, model)
-      : model;
+    // Model routing: a manually selected cloud model always wins; smart-routing
+    // only ever picks among LOCAL models (cloud is opt-in per session, never automatic).
+    const activeModel = isCloudModel(model)
+      ? model
+      : (smartRoute ? pickModelForMode(effectiveMode, models, model) : model);
+    const cloudActive = isCloudModel(activeModel);
 
-    // Memory-aware context clamp: a 14B model's KV cache at 32K (~6GB) plus
-    // ~9GB of weights exceeds this machine's 16GB unified memory and generation
-    // collapses into swap (measured 0.5 tok/s at 32K vs 5.5 tok/s at 16K).
-    // Models ≥8GB on disk get a 16K window; smaller models keep the mode default.
-    const modelBytes = modelMeta[activeModel]?.size || 0;
-    const effectiveNumCtx = modelBytes >= 8e9
-      ? Math.min(modelSettings.numCtx, 16384)
-      : modelSettings.numCtx;
+    // Memory-aware context clamp (local models only): cap num_ctx at the largest
+    // window the model's weights + estimated KV cache actually fit in (see
+    // modelFit.js — calibrated against measured swap collapse on this machine).
+    // Cloud models have huge windows — the value below only drives compaction.
+    let effectiveNumCtx;
+    if (cloudActive) {
+      effectiveNumCtx = 131072;
+    } else {
+      const fit = modelFit(modelMeta[activeModel]?.size || 0, ramBytes);
+      effectiveNumCtx = fit.maxCtx
+        ? Math.min(modelSettings.numCtx, fit.maxCtx)
+        : Math.min(modelSettings.numCtx, 8192); // red model the user insists on — degrade, don't die
+    }
 
     if (effectiveMode==="image") {
       const id = Date.now();
@@ -2885,7 +2958,7 @@ MEMORY: If you learn a user preference, project constraint, correction, or recur
       if (effectiveMode === "arb" && ragIndex && ragStatus === "ready") {
         try {
           const qEmbed = await embedQuery(prompt);
-          const chunks = retrieveChunks(ragIndex, qEmbed, 4);
+          const chunks = hybridRetrieve(ragIndex.chunks, qEmbed, prompt, 4);
           if (chunks.length > 0) {
             sys += `\n\n[CODEBASE CONTEXT — top ${chunks.length} chunks from arb bot source]\n${formatRagContext(chunks)}\n[END CODEBASE CONTEXT]`;
           }
@@ -2897,7 +2970,7 @@ MEMORY: If you learn a user preference, project constraint, correction, or recur
       if (knowledgeIndex && (knowledgeStatus === "ready" || knowledgeStatus === "stale")) {
         try {
           const qEmbed = await embedQuery(prompt);
-          const chunks = retrieveChunks(knowledgeIndex, qEmbed, 3);
+          const chunks = hybridRetrieve(knowledgeIndex.chunks, qEmbed, prompt, 3);
           if (chunks.length > 0) {
             sys += `\n\n[PERSONAL KNOWLEDGE BASE — ${chunks.length} relevant passages from your documents]\n${formatRagContext(chunks)}\n[END KNOWLEDGE BASE]`;
           }
@@ -2936,19 +3009,11 @@ MEMORY: If you learn a user preference, project constraint, correction, or recur
           if (estTokens > ctxLimit * 0.85 && activeModel) {
             // Level 2 — LLM summary
             try {
-              const summaryResp = await invoke("ollama_post", {
-                path: "/api/chat",
-                body: JSON.stringify({
-                  model: activeModel,
-                  stream: false,
-                  messages: [
-                    { role: "system", content: "Summarize this conversation in ≤250 words. Preserve: code snippets, addresses/numbers, key decisions, current task state. Be factual and dense." },
-                    { role: "user",   content: older.map(m => `[${m.role}]: ${(m.content||"").slice(0,600)}`).join("\n---\n") },
-                  ],
-                  options: { temperature: 0.1, num_ctx: 16384 },
-                }),
-              });
-              const summary = JSON.parse(summaryResp).message?.content || "";
+              const summaryResp = await chatOnce(activeModel, [
+                { role: "system", content: "Summarize this conversation in ≤250 words. Preserve: code snippets, addresses/numbers, key decisions, current task state. Be factual and dense." },
+                { role: "user",   content: older.map(m => `[${m.role}]: ${(m.content||"").slice(0,600)}`).join("\n---\n") },
+              ], null, { temperature: 0.1, num_ctx: 16384 });
+              const summary = summaryResp.message?.content || "";
               ollamaHistory = [
                 { role: "user",      content: `[⚡ Context summary — ${older.length} earlier messages]\n${summary}` },
                 { role: "assistant", content: "Understood, I have context from the earlier conversation." },
@@ -3006,6 +3071,8 @@ MEMORY: If you learn a user preference, project constraint, correction, or recur
           loops: 0, toolCalls: 0, toolErrors: 0, stopRejections: 0,
           outcome: "answered", startedAt: Date.now(),
         };
+        // Cloud token/cost accumulation across loop iterations
+        const cloudUsage = { prompt: 0, completion: 0, cost: 0, seen: false };
 
         // Prompt-injection provenance: flips true once untrusted web content (fetch_url /
         // deep_search) enters context this turn. While true, any state-changing tool must
@@ -3076,6 +3143,13 @@ After getting results, give your final answer in normal markdown. Never include 
                   if (j.message?.tool_calls?.length) {
                     toolCalls = j.message.tool_calls;
                   }
+                  // Cloud providers report usage (tokens + cost) on the final chunk
+                  if (j.cloud_usage) {
+                    cloudUsage.seen = true;
+                    cloudUsage.prompt     += j.cloud_usage.prompt_tokens || 0;
+                    cloudUsage.completion += j.cloud_usage.completion_tokens || 0;
+                    cloudUsage.cost       += j.cloud_usage.cost || 0;
+                  }
                 } catch {}
               }
             });
@@ -3083,7 +3157,21 @@ After getting results, give your final answer in normal markdown. Never include 
             let invokeErr = null;
             let toolsNotSupported = false;
             try {
-              await invoke("ollama_chat", { body: JSON.stringify(agentReqBody), eventId });
+              if (cloudActive) {
+                const cloudBody = toOpenAIBody({
+                  model: cloudModelId(activeModel),
+                  messages: loopMsgs,
+                  tools: usePromptTools ? null : modeToolSet,
+                  temperature: modelSettings.temperature,
+                }, cloudProvider(activeModel));
+                await invoke("cloud_chat", {
+                  provider: cloudProvider(activeModel),
+                  body: JSON.stringify(cloudBody),
+                  eventId,
+                });
+              } else {
+                await invoke("ollama_chat", { body: JSON.stringify(agentReqBody), eventId });
+              }
             } catch(err) {
               const msg = String(err);
               if (msg.toLowerCase().includes("does not support tools")) {
@@ -3484,7 +3572,7 @@ After getting results, give your final answer in normal markdown. Never include 
                     if (knowledgeIndex && (knowledgeStatus === "ready" || knowledgeStatus === "stale")) {
                       try {
                         const qEmbed = await embedQuery(fnArgs.query);
-                        const chunks = retrieveChunks(knowledgeIndex, qEmbed, 5);
+                        const chunks = hybridRetrieve(knowledgeIndex.chunks, qEmbed, fnArgs.query, 5);
                         toolResult = chunks.length
                           ? formatRagContext(chunks)
                           : "No relevant documents found in knowledge base.";
@@ -3586,19 +3674,11 @@ After getting results, give your final answer in normal markdown. Never include 
                 if (estToks > ctxLimit * 0.85) {
                   // Level 2 — LLM-summarize older research steps
                   try {
-                    const summaryResp = await invoke("ollama_post", {
-                      path: "/api/chat",
-                      body: JSON.stringify({
-                        model: activeModel,
-                        stream: false,
-                        messages: [
-                          { role: "system", content: "Summarize these agent research steps in ≤200 words. Preserve: key findings, URLs, numbers, file paths, decisions. Dense facts only." },
-                          { role: "user",   content: older.map(m => `[${m.role}]: ${(m.content||"").slice(0, 600)}`).join("\n---\n") },
-                        ],
-                        options: { temperature: 0.1, num_ctx: 16384 },
-                      }),
-                    });
-                    const summary = JSON.parse(summaryResp).message?.content || "";
+                    const summaryResp = await chatOnce(activeModel, [
+                      { role: "system", content: "Summarize these agent research steps in ≤200 words. Preserve: key findings, URLs, numbers, file paths, decisions. Dense facts only." },
+                      { role: "user",   content: older.map(m => `[${m.role}]: ${(m.content||"").slice(0, 600)}`).join("\n---\n") },
+                    ], null, { temperature: 0.1, num_ctx: 16384 });
+                    const summary = summaryResp.message?.content || "";
                     // Rebuild ollamaMsgs: system + summary pair + recent
                     ollamaMsgs.length = 1;
                     ollamaMsgs.push(
@@ -3650,8 +3730,17 @@ After getting results, give your final answer in normal markdown. Never include 
           if (ctrl.signal.aborted && telemetry.outcome === "answered") telemetry.outcome = "aborted";
           const { startedAt, ...rest } = telemetry;
           invoke("append_telemetry", {
-            line: JSON.stringify({ ts: new Date().toISOString(), ...rest, durationS: Math.round((Date.now() - startedAt) / 1000) }),
+            line: JSON.stringify({
+              ts: new Date().toISOString(), ...rest,
+              durationS: Math.round((Date.now() - startedAt) / 1000),
+              ...(cloudUsage.seen ? {
+                promptTokens: cloudUsage.prompt,
+                completionTokens: cloudUsage.completion,
+                costUSD: Math.round(cloudUsage.cost * 1e6) / 1e6,
+              } : {}),
+            }),
           }).catch(() => {});
+          if (cloudUsage.cost > 0) setSessionCost(prev => prev + cloudUsage.cost);
           // Attach revert info when this turn changed files (even on abort/error —
           // a half-finished turn is exactly when you want to rewind).
           if (turnCheckpoint.mutatedPaths.size > 0) {
@@ -3708,13 +3797,23 @@ After getting results, give your final answer in normal markdown. Never include 
                 });
               }
             }
+            if (j.cloud_usage?.cost) setSessionCost(prev => prev + j.cloud_usage.cost);
           } catch {}
         }
       });
 
       try {
         // invoke blocks until the full stream is done (or aborted via ollama_abort)
-        await invoke("ollama_chat", { body: JSON.stringify(reqBody), eventId });
+        if (cloudActive) {
+          const cloudBody = toOpenAIBody({
+            model: cloudModelId(activeModel),
+            messages: reqBody.messages,
+            temperature: modelSettings.temperature,
+          }, cloudProvider(activeModel));
+          await invoke("cloud_chat", { provider: cloudProvider(activeModel), body: JSON.stringify(cloudBody), eventId });
+        } else {
+          await invoke("ollama_chat", { body: JSON.stringify(reqBody), eventId });
+        }
       } catch(err) {
         const msg = String(err);
         if (!msg.includes("cancelled") && !msg.includes("abort")) {
@@ -3746,10 +3845,13 @@ After getting results, give your final answer in normal markdown. Never include 
   const accentMap = isDark ? DARK_ACCENTS : LIGHT_ACCENTS;
   const accent = accentMap[mode] || "#78716c";
 
-  // What model would smart-routing pick for the current mode (for display in header/sidebar)
-  const displayModel = smartRoute && models.length > 0
-    ? pickModelForMode(mode === "auto" ? "auto" : mode, models, model)
-    : model;
+  // What model would smart-routing pick for the current mode (for display in header/sidebar).
+  // Manual cloud selection always displays as-is — smart-route never overrides it.
+  const displayModel = isCloudModel(model)
+    ? model
+    : (smartRoute && models.length > 0
+        ? pickModelForMode(mode === "auto" ? "auto" : mode, models, model)
+        : model);
   const isRouted = smartRoute && displayModel && displayModel !== model;
 
   const visibleSnippets = SNIPPETS.filter(s => s.mode === mode);
@@ -3957,10 +4059,39 @@ After getting results, give your final answer in normal markdown. Never include 
               <div style={{ marginTop:6, padding:"8px 8px 6px", background:isDark?"rgba(160,130,255,0.05)":"rgba(100,70,200,0.04)", borderRadius:8, border:`0.5px solid var(--tny-line2)` }}>
                 <select value={model} onChange={e=>setModel(e.target.value)}
                   style={{ width:"100%", background:"transparent", border:"none", color:"var(--tny-tx2)", fontSize:11, fontFamily:"'JetBrains Mono',monospace", cursor:"pointer", outline:"none", marginBottom:5 }}>
-                  {models.length > 0 ? models.map(m=><option key={m}>{m}</option>) : <option>No models</option>}
+                  <optgroup label="Local (Ollama)">
+                    {models.length > 0 ? models.map(m => {
+                      const f = modelFit(modelMeta[m]?.size || 0, ramBytes);
+                      return <option key={m} value={m} title={f.detail}>{FIT_DOT[f.level]} {m}</option>;
+                    }) : <option>No models</option>}
+                  </optgroup>
+                  {cloudModels.length > 0 && (
+                    <optgroup label="☁ Cloud (per-token billing)">
+                      {cloudModels.map(m => (
+                        <option key={m} value={m}>☁ {cloudDisplayName(m)}</option>
+                      ))}
+                    </optgroup>
+                  )}
                 </select>
-                {/* Age + pull row for selected model */}
+                {/* Fit explanation for the selected model */}
                 {model && (() => {
+                  if (isCloudModel(model)) {
+                    return (
+                      <div style={{ fontSize:9, color:"#38bdf8", fontFamily:"'JetBrains Mono',monospace", marginBottom:5, lineHeight:1.4 }}>
+                        ☁ cloud model via {cloudProvider(model) === "openrouter" ? "OpenRouter" : "OpenAI"} — billed per token, cost shown in header
+                      </div>
+                    );
+                  }
+                  if (ramBytes <= 0) return null;
+                  const f = modelFit(modelMeta[model]?.size || 0, ramBytes);
+                  return (
+                    <div style={{ fontSize:9, color: f.level==="red" ? "#ef4444" : f.level==="yellow" ? "#eab308" : "var(--tny-tx5)", fontFamily:"'JetBrains Mono',monospace", marginBottom:5, lineHeight:1.4 }}>
+                      {FIT_DOT[f.level]} {f.detail}
+                    </div>
+                  );
+                })()}
+                {/* Age + pull row for selected model (local only — cloud models aren't pulled) */}
+                {model && !isCloudModel(model) && (() => {
                   const age = modelAgeDays(model);
                   const isPulling = pullingModel === model;
                   const status = pullStatus[model];
@@ -4022,6 +4153,7 @@ After getting results, give your final answer in normal markdown. Never include 
             <button onClick={()=>setShowMemory(p=>!p)} className={`header-btn${showMemory?" active":""}`}>Memory</button>
             {mode!=="image" && <button onClick={()=>setShowContext(p=>!p)} className={`header-btn${showContext?" active":""}`}>Context</button>}
             <button onClick={()=>setShowMcpPanel(p=>!p)} className={`header-btn${showMcpPanel?" active":""}`}>MCP</button>
+            <button onClick={()=>setShowCompare(p=>!p)} className={`header-btn${showCompare?" active":""}`} title="Blind A/B model comparison">Compare</button>
             <button onClick={exportConversation} className="header-btn">Export</button>
             <button onClick={()=>setAgentPanel(p=>!p)} className={`header-btn${showAgentPanel?" active":""}`} title="Search API key & settings">⚙ Search</button>
             {/* Alerts button with unread badge */}
@@ -4043,6 +4175,13 @@ After getting results, give your final answer in normal markdown. Never include 
                 </button>
               );
             })()}
+            {/* Cloud spend this app session */}
+            {sessionCost > 0 && (
+              <span title={`Cloud API spend since launch: $${sessionCost.toFixed(4)}`}
+                style={{ display:"flex", alignItems:"center", gap:4, padding:"4px 10px", height:26, fontSize:11, fontFamily:"monospace", color:"rgba(56,189,248,0.85)", background:"rgba(56,189,248,0.07)", border:"0.5px solid rgba(56,189,248,0.18)", borderRadius:20 }}>
+                ☁ ${sessionCost < 0.01 ? sessionCost.toFixed(4) : sessionCost.toFixed(2)}
+              </span>
+            )}
             {/* Ollama status badge — green pill per spec */}
             <button onClick={bootstrap}
               style={{ display:"flex", alignItems:"center", gap:5, padding:"4px 10px", height:26,
@@ -4078,6 +4217,16 @@ After getting results, give your final answer in normal markdown. Never include 
           />
         )}
 
+        {/* Blind model comparison */}
+        {showCompare && (
+          <ComparePanel
+            localModels={models}
+            cloudModels={cloudModels}
+            accent={accent}
+            onClose={()=>setShowCompare(false)}
+          />
+        )}
+
         {/* Search & Agent settings — available in all modes */}
         {showAgentPanel&&(
           <div style={{ padding:"10px 20px 12px", borderTop:"1px solid var(--tny-line)", background:"var(--tny-sidebar)", flexShrink:0 }}>
@@ -4093,6 +4242,27 @@ After getting results, give your final answer in normal markdown. Never include 
               <b style={{ color:"var(--tny-tx3)" }}>Brave</b> — key starts with BSA, get free key at <span style={{ color:accent }}>api.search.brave.com</span><br/>
               <b style={{ color:"var(--tny-tx3)" }}>SearXNG local</b> — type <span style={{ fontFamily:"'JetBrains Mono',monospace" }}>searxng</span>, run: <span style={{ fontFamily:"'JetBrains Mono',monospace" }}>docker run -d -p 8080:8080 searxng/searxng</span><br/>
               <b style={{ color:"var(--tny-tx3)" }}>No key</b> — uses DuckDuckGo HTML scrape (works, less reliable)
+            </div>
+            {/* Cloud provider keys */}
+            <div style={{ marginTop:10, paddingTop:8, borderTop:"1px solid var(--tny-line)" }}>
+              <div style={{ fontSize:10, color:"var(--tny-tx5)", letterSpacing:"0.08em", textTransform:"uppercase", marginBottom:6 }}>☁ Cloud Models (optional)</div>
+              <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:6 }}>
+                <span style={{ fontSize:12, color:"var(--tny-tx3)", whiteSpace:"nowrap", width:110 }}>OpenRouter key</span>
+                <input type="password" value={openrouterKey} onChange={e=>setOpenrouterKey(e.target.value)}
+                  placeholder="sk-or-v1-…  (openrouter.ai/keys — Claude, Gemini, DeepSeek + more)"
+                  style={{ flex:1, background:"var(--tny-surface)", border:"1px solid var(--tny-line2)", borderRadius:6, padding:"5px 9px", fontSize:12, color:"var(--tny-tx1)", fontFamily:"'JetBrains Mono',monospace", outline:"none" }}/>
+              </div>
+              <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                <span style={{ fontSize:12, color:"var(--tny-tx3)", whiteSpace:"nowrap", width:110 }}>OpenAI key</span>
+                <input type="password" value={openaiKey} onChange={e=>setOpenaiKey(e.target.value)}
+                  placeholder="sk-…  (platform.openai.com — GPT models direct, no markup)"
+                  style={{ flex:1, background:"var(--tny-surface)", border:"1px solid var(--tny-line2)", borderRadius:6, padding:"5px 9px", fontSize:12, color:"var(--tny-tx1)", fontFamily:"'JetBrains Mono',monospace", outline:"none" }}/>
+              </div>
+              <div style={{ marginTop:5, fontSize:10, color:"var(--tny-tx5)", lineHeight:1.5 }}>
+                {cloudModels.length > 0
+                  ? `☁ ${cloudModels.length} cloud models available in the sidebar model picker. Cloud is manual-select only — smart routing stays local.`
+                  : "Keys are stored in ~/.tonyai (mode 0600), never in the webview. Add one to unlock frontier models in the picker."}
+              </div>
             </div>
             <div style={{ marginTop:10, paddingTop:8, borderTop:"1px solid var(--tny-line)" }}>
               <div style={{ fontSize:10, color:"var(--tny-tx5)", letterSpacing:"0.08em", textTransform:"uppercase", marginBottom:6 }}>Permissions</div>

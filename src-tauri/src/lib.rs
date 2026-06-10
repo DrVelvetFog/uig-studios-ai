@@ -467,6 +467,23 @@ fn append_telemetry(line: String) -> Result<(), String> {
     writeln!(f, "{}", line.replace('\n', " ")).map_err(|e| e.to_string())
 }
 
+/// One JSON line per blind-comparison vote in ~/.tonyai/compare-votes.jsonl.
+#[tauri::command]
+fn append_compare_vote(line: String) -> Result<(), String> {
+    use std::io::Write;
+    let dir = tonyai_dir()?;
+    let path = dir.join("compare-votes.jsonl");
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 2 * 1024 * 1024 {
+            let _ = std::fs::rename(&path, dir.join("compare-votes.jsonl.1"));
+        }
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true).append(true).open(&path)
+        .map_err(|e| e.to_string())?;
+    writeln!(f, "{}", line.replace('\n', " ")).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn read_telemetry() -> Result<String, String> {
     let path = tonyai_dir()?.join("telemetry.jsonl");
@@ -678,6 +695,293 @@ fn ollama_abort(cancel: State<'_, StreamCancelMap>, event_id: Option<String>) {
             }
         }
     }
+}
+
+// ── Cloud providers (OpenRouter + OpenAI, Chat Completions wire format) ──────
+// The frontend keeps speaking Ollama's ndjson chunk shape; these commands
+// translate OpenAI-style SSE into it, so the agent loop is provider-agnostic.
+
+fn cloud_endpoint(provider: &str) -> Result<(&'static str, &'static str), String> {
+    match provider {
+        "openrouter" => Ok(("https://openrouter.ai/api/v1/chat/completions", "openrouter")),
+        "openai"     => Ok(("https://api.openai.com/v1/chat/completions", "openai")),
+        _ => Err(format!("unknown cloud provider: {provider}")),
+    }
+}
+
+fn read_secret_value(key: &str) -> Result<String, String> {
+    if !secret_key_ok(key) { return Err("invalid secret key".into()); }
+    let path = tonyai_dir()?.join(format!("secret-{}.txt", key));
+    let v = std::fs::read_to_string(&path).unwrap_or_default();
+    let v = v.trim().to_string();
+    if v.is_empty() {
+        return Err(format!("No API key stored for {key} — add it in ⚙ Search settings"));
+    }
+    Ok(v)
+}
+
+fn cloud_request(provider: &str, url: &str, body: String, timeout_s: u64) -> Result<reqwest::RequestBuilder, String> {
+    let key = read_secret_value(provider)?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_s))
+        .build().map_err(|e| e.to_string())?;
+    let mut req = client.post(url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", key));
+    if provider == "openrouter" {
+        req = req
+            .header("HTTP-Referer", "https://github.com/DrVelvetFog/tonyai")
+            .header("X-Title", "TonyAI");
+    }
+    Ok(req.body(body))
+}
+
+/// Accumulates streamed OpenAI tool-call fragments (arguments arrive in pieces).
+#[derive(Default)]
+struct ToolCallAccum {
+    id:   String,
+    name: String,
+    args: String,
+}
+
+/// Translate one SSE `data:` payload into Ollama-shaped ndjson (returned),
+/// accumulating tool-call fragments and usage along the way. Pure — testable.
+fn translate_sse_data(
+    data: &str,
+    tool_calls: &mut StdHashMap<u64, ToolCallAccum>,
+    usage_line: &mut Option<String>,
+) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(data).ok()?;
+
+    if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
+        *usage_line = Some(format!("{}\n", serde_json::json!({ "cloud_usage": u })));
+    }
+
+    let delta = v.pointer("/choices/0/delta")?;
+
+    if let Some(frags) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+        for frag in frags {
+            let idx = frag.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+            let acc = tool_calls.entry(idx).or_default();
+            if let Some(id) = frag.get("id").and_then(|i| i.as_str()) {
+                if !id.is_empty() { acc.id = id.to_string(); }
+            }
+            if let Some(name) = frag.pointer("/function/name").and_then(|n| n.as_str()) {
+                acc.name.push_str(name);
+            }
+            if let Some(args) = frag.pointer("/function/arguments").and_then(|a| a.as_str()) {
+                acc.args.push_str(args);
+            }
+        }
+    }
+
+    let content = delta.get("content").and_then(|c| c.as_str()).filter(|c| !c.is_empty())?;
+    Some(format!("{}\n", serde_json::json!({ "message": { "content": content } })))
+}
+
+/// Final chunk for any reassembled tool calls, in Ollama's shape.
+fn finalize_tool_calls(tool_calls: &StdHashMap<u64, ToolCallAccum>) -> Option<String> {
+    if tool_calls.is_empty() { return None; }
+    let mut indices: Vec<&u64> = tool_calls.keys().collect();
+    indices.sort();
+    let calls: Vec<serde_json::Value> = indices.iter().map(|i| {
+        let acc = &tool_calls[i];
+        let args: serde_json::Value = serde_json::from_str(&acc.args)
+            .unwrap_or(serde_json::Value::String(acc.args.clone()));
+        serde_json::json!({
+            "id": if acc.id.is_empty() { format!("call_{}", i) } else { acc.id.clone() },
+            "function": { "name": acc.name, "arguments": args }
+        })
+    }).collect();
+    Some(format!("{}\n", serde_json::json!({ "message": { "tool_calls": calls } })))
+}
+
+#[cfg(test)]
+mod cloud_sse_tests {
+    use super::*;
+
+    #[test]
+    fn translates_content_deltas() {
+        let mut tc = StdHashMap::new();
+        let mut usage = None;
+        let out = translate_sse_data(
+            r#"{"choices":[{"delta":{"content":"Hello"}}]}"#, &mut tc, &mut usage,
+        ).unwrap();
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v.pointer("/message/content").unwrap(), "Hello");
+    }
+
+    #[test]
+    fn reassembles_fragmented_tool_calls() {
+        let mut tc = StdHashMap::new();
+        let mut usage = None;
+        // OpenAI streams the call name first, then argument string fragments
+        translate_sse_data(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","function":{"name":"list_dir","arguments":""}}]}}]}"#, &mut tc, &mut usage);
+        translate_sse_data(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"pa"}}]}}]}"#, &mut tc, &mut usage);
+        translate_sse_data(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"/tmp\"}"}}]}}]}"#, &mut tc, &mut usage);
+
+        let out = finalize_tool_calls(&tc).unwrap();
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        let call = &v["message"]["tool_calls"][0];
+        assert_eq!(call["id"], "call_abc");
+        assert_eq!(call["function"]["name"], "list_dir");
+        assert_eq!(call["function"]["arguments"]["path"], "/tmp");
+    }
+
+    #[test]
+    fn captures_usage_and_ignores_garbage() {
+        let mut tc = StdHashMap::new();
+        let mut usage = None;
+        translate_sse_data(
+            r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"cost":0.0012}}"#,
+            &mut tc, &mut usage,
+        );
+        assert!(usage.as_deref().unwrap().contains("\"cost\":0.0012"));
+        assert!(translate_sse_data("not json", &mut tc, &mut usage).is_none());
+        assert!(finalize_tool_calls(&StdHashMap::new()).is_none());
+    }
+}
+
+/// Streaming chat against a cloud provider. Emits the same
+/// "ollama-chunk-{event_id}" / "ollama-done-{event_id}" events as ollama_chat,
+/// with chunks translated to Ollama's ndjson message shape. Usage (tokens +
+/// cost when the provider reports it) is emitted as a {"cloud_usage": ...} line.
+#[tauri::command]
+async fn cloud_chat(
+    app: AppHandle,
+    cancel: State<'_, StreamCancelMap>,
+    provider: String,
+    body: String,
+    event_id: String,
+) -> Result<(), String> {
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    cancel.0.lock().unwrap().insert(event_id.clone(), Arc::clone(&cancel_flag));
+    struct CancelCleanup<'a>(&'a StreamCancelMap, String);
+    impl<'a> Drop for CancelCleanup<'a> {
+        fn drop(&mut self) { self.0.0.lock().unwrap().remove(&self.1); }
+    }
+    let _cleanup = CancelCleanup(&cancel, event_id.clone());
+
+    let (url, _) = cloud_endpoint(&provider)?;
+    let response = cloud_request(&provider, url, body, 600)?
+        .send().await
+        .map_err(|e| format!("{provider} connection failed: {e}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("{provider} {}: {}", status, text.chars().take(400).collect::<String>()));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut line_buf = String::new();      // partial SSE line carry-over
+    let mut out_buf  = String::new();      // translated ndjson awaiting emit
+    let mut last_emit = std::time::Instant::now();
+    let mut tool_calls: StdHashMap<u64, ToolCallAccum> = StdHashMap::new();
+    let mut usage_line: Option<String> = None;
+
+    'outer: while let Some(chunk) = stream.next().await {
+        if cancel_flag.load(Ordering::Relaxed) { break; }
+        let bytes = chunk.map_err(|e| e.to_string())?;
+        line_buf.push_str(&String::from_utf8_lossy(&bytes));
+
+        while let Some(nl) = line_buf.find('\n') {
+            let line: String = line_buf.drain(..=nl).collect();
+            let line = line.trim();
+            let Some(data) = line.strip_prefix("data:") else { continue };
+            let data = data.trim();
+            if data == "[DONE]" { break 'outer; }
+            if let Some(ndjson) = translate_sse_data(data, &mut tool_calls, &mut usage_line) {
+                out_buf.push_str(&ndjson);
+            }
+        }
+
+        if !out_buf.is_empty() && (last_emit.elapsed().as_millis() >= 16 || out_buf.len() >= 512) {
+            let _ = app.emit(&format!("ollama-chunk-{}", event_id), std::mem::take(&mut out_buf));
+            last_emit = std::time::Instant::now();
+        }
+    }
+
+    // Reassembled tool calls → one Ollama-shaped chunk
+    if let Some(calls_line) = finalize_tool_calls(&tool_calls) {
+        out_buf.push_str(&calls_line);
+    }
+    if let Some(u) = usage_line { out_buf.push_str(&u); }
+    if !out_buf.is_empty() {
+        let _ = app.emit(&format!("ollama-chunk-{}", event_id), out_buf);
+    }
+    let _ = app.emit(&format!("ollama-done-{}", event_id), "");
+    Ok(())
+}
+
+/// Non-streaming cloud completion (subagents, compaction summaries).
+/// Returns an Ollama-shaped response: {"message":{"content","tool_calls"?},"cloud_usage"?}.
+#[tauri::command]
+async fn cloud_post(provider: String, body: String) -> Result<String, String> {
+    let (url, _) = cloud_endpoint(&provider)?;
+    let resp = cloud_request(&provider, url, body, 300)?
+        .send().await
+        .map_err(|e| format!("{provider} connection failed: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("{provider} {}: {}", status, text.chars().take(400).collect::<String>()));
+    }
+    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let msg = v.pointer("/choices/0/message").cloned().unwrap_or(serde_json::json!({}));
+
+    let mut out_msg = serde_json::json!({
+        "content": msg.get("content").and_then(|c| c.as_str()).unwrap_or(""),
+    });
+    if let Some(calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+        let converted: Vec<serde_json::Value> = calls.iter().map(|c| {
+            let args_str = c.pointer("/function/arguments").and_then(|a| a.as_str()).unwrap_or("{}");
+            let args: serde_json::Value = serde_json::from_str(args_str)
+                .unwrap_or(serde_json::Value::String(args_str.to_string()));
+            serde_json::json!({
+                "id": c.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                "function": {
+                    "name": c.pointer("/function/name").and_then(|n| n.as_str()).unwrap_or(""),
+                    "arguments": args
+                }
+            })
+        }).collect();
+        out_msg["tool_calls"] = serde_json::Value::Array(converted);
+    }
+
+    let mut out = serde_json::json!({ "message": out_msg });
+    if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
+        out["cloud_usage"] = u.clone();
+    }
+    Ok(out.to_string())
+}
+
+/// List available model ids from a cloud provider (frontend curates the list).
+#[tauri::command]
+async fn cloud_list_models(provider: String) -> Result<String, String> {
+    let url = match provider.as_str() {
+        "openrouter" => "https://openrouter.ai/api/v1/models",
+        "openai"     => "https://api.openai.com/v1/models",
+        _ => return Err(format!("unknown cloud provider: {provider}")),
+    };
+    let key = read_secret_value(&provider)?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build().map_err(|e| e.to_string())?;
+    let resp = client.get(url)
+        .header("Authorization", format!("Bearer {}", key))
+        .send().await
+        .map_err(|e| format!("{provider} models fetch failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("{provider} models HTTP {}", resp.status()));
+    }
+    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let ids: Vec<String> = v.get("data").and_then(|d| d.as_array())
+        .map(|arr| arr.iter()
+            .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from))
+            .collect())
+        .unwrap_or_default();
+    serde_json::to_string(&ids).map_err(|e| e.to_string())
 }
 
 // ── Agent tool commands ───────────────────────────────────────────────────────
@@ -1018,6 +1322,22 @@ fn tool_read_file(path: String) -> Result<String, String> {
 #[tauri::command]
 fn get_home_dir() -> String {
     std::env::var("HOME").unwrap_or_default()
+}
+
+/// Hardware facts for model-fit estimation: total RAM + chip name.
+#[tauri::command]
+fn get_hardware_info() -> Result<String, String> {
+    let read_sysctl = |key: &str| -> String {
+        std::process::Command::new("sysctl")
+            .args(["-n", key])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    };
+    let ram_bytes: u64 = read_sysctl("hw.memsize").parse().unwrap_or(0);
+    let chip = read_sysctl("machdep.cpu.brand_string");
+    Ok(serde_json::json!({ "ram_bytes": ram_bytes, "chip": chip }).to_string())
 }
 
 /// Search file contents by regex pattern across a directory tree (grep -rn style).
@@ -2499,6 +2819,7 @@ pub fn run() {
             launch_self_update,
             append_telemetry,
             read_telemetry,
+            append_compare_vote,
             read_inbox,
             save_inbox,
             ollama_tags,
@@ -2506,9 +2827,13 @@ pub fn run() {
             ollama_post,
             ollama_chat,
             ollama_abort,
+            cloud_chat,
+            cloud_post,
+            cloud_list_models,
             tool_web_search,
             tool_fetch_url,
             get_home_dir,
+            get_hardware_info,
             tool_read_file,
             tool_write_file,
             tool_edit_file,
