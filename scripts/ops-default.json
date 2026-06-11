@@ -1,5 +1,5 @@
 {
-  "comment": "TonyAI portfolio ops checks. This file seeds ~/.tonyai/ops.json on first run — edit THAT copy (read every run). Delete ~/.tonyai/ops.json to re-seed from here. Fields: intervalMin (check cadence), severity (critical=notification, warning/info=inbox only), expect for pm2 (online | not-errored | report).",
+  "comment": "TonyAI portfolio ops checks. This file seeds ~/.tonyai/ops.json on first run \u2014 edit THAT copy (read every run). Delete ~/.tonyai/ops.json to re-seed from here. Fields: intervalMin (check cadence), severity (critical=notification, warning/info=inbox only), expect for pm2 (online | not-errored | report).",
   "checks": [
     {
       "id": "por-attestor",
@@ -59,7 +59,10 @@
       "project": "FairLine",
       "label": "watcher + dashboard",
       "type": "pm2",
-      "processes": ["fairline-watcher", "fairline-dashboard"],
+      "processes": [
+        "fairline-watcher",
+        "fairline-dashboard"
+      ],
       "expect": "online",
       "intervalMin": 5,
       "severity": "warning"
@@ -69,7 +72,14 @@
       "project": "FairLine",
       "label": "cron processes",
       "type": "pm2",
-      "processes": ["fairline-snapshot", "fairline-mark", "fairline-summary", "fairline-flywheel", "fairline-vault-engine", "fairline-mm"],
+      "processes": [
+        "fairline-snapshot",
+        "fairline-mark",
+        "fairline-summary",
+        "fairline-flywheel",
+        "fairline-vault-engine",
+        "fairline-mm"
+      ],
       "expect": "not-errored",
       "intervalMin": 30,
       "severity": "warning"
@@ -88,22 +98,11 @@
       "project": "Bots",
       "label": "sui-arb-bot",
       "type": "pm2",
-      "processes": ["sui-arb-bot"],
+      "processes": [
+        "sui-arb-bot"
+      ],
       "expect": "report",
       "intervalMin": 30
-    },
-    {
-      "id": "navi-liq-dead",
-      "project": "Bots",
-      "label": "navi-liq stays OFF",
-      "type": "ssh-pm2-absent",
-      "host": "root@139.180.156.63",
-      "sshKey": "~/.ssh/vultr_sg",
-      "process": "navi-liq",
-      "intervalMin": 60,
-      "severity": "critical",
-      "alertUnknown": true,
-      "note": "must stay OFF until flat-fee RPC plan — last accidental run cost $400 in Chainstack overage"
     }
   ]
 }
