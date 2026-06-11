@@ -1,0 +1,109 @@
+{
+  "comment": "TonyAI portfolio ops checks. This file seeds ~/.tonyai/ops.json on first run — edit THAT copy (read every run). Delete ~/.tonyai/ops.json to re-seed from here. Fields: intervalMin (check cadence), severity (critical=notification, warning/info=inbox only), expect for pm2 (online | not-errored | report).",
+  "checks": [
+    {
+      "id": "por-attestor",
+      "project": "PoR",
+      "label": "attestor (Render)",
+      "type": "http",
+      "url": "https://por-attestor.onrender.com/api/health",
+      "intervalMin": 5,
+      "timeoutMs": 55000,
+      "severity": "critical",
+      "note": "5-min ping doubles as Render free-tier keep-alive (cold start ~40s otherwise)"
+    },
+    {
+      "id": "por-site",
+      "project": "PoR",
+      "label": "landing site",
+      "type": "http",
+      "url": "https://por-proof-of-real.netlify.app",
+      "intervalMin": 30,
+      "severity": "warning"
+    },
+    {
+      "id": "por-gas",
+      "project": "PoR",
+      "label": "attestor gas wallet",
+      "type": "sui-balance",
+      "rpc": "https://fullnode.testnet.sui.io:443",
+      "address": "0x9f4d4eeff1807dab5ca657d9bb5cf62db936b196d722dfa3eef0889851532cba",
+      "minBalanceSui": 0.2,
+      "intervalMin": 60,
+      "severity": "critical",
+      "note": "top up testnet SUI before it runs dry mid-demo"
+    },
+    {
+      "id": "por-minted",
+      "project": "PoR",
+      "label": "credentials minted",
+      "type": "sui-object-field",
+      "rpc": "https://fullnode.testnet.sui.io:443",
+      "objectId": "0x446ddd3bbda15b6760a54b092e84d475351480ca2a7d4a3f99265cfd7d9ae23e",
+      "field": "total_minted",
+      "intervalMin": 60,
+      "severity": "warning",
+      "growthNote": "Someone minted a PoR credential"
+    },
+    {
+      "id": "hole-site",
+      "project": "Hole in Town",
+      "label": "game site",
+      "type": "http",
+      "url": "https://hole-in-town-26352.netlify.app",
+      "intervalMin": 30,
+      "severity": "warning"
+    },
+    {
+      "id": "fairline-core",
+      "project": "FairLine",
+      "label": "watcher + dashboard",
+      "type": "pm2",
+      "processes": ["fairline-watcher", "fairline-dashboard"],
+      "expect": "online",
+      "intervalMin": 5,
+      "severity": "warning"
+    },
+    {
+      "id": "fairline-crons",
+      "project": "FairLine",
+      "label": "cron processes",
+      "type": "pm2",
+      "processes": ["fairline-snapshot", "fairline-mark", "fairline-summary", "fairline-flywheel", "fairline-vault-engine", "fairline-mm"],
+      "expect": "not-errored",
+      "intervalMin": 30,
+      "severity": "warning"
+    },
+    {
+      "id": "fairline-dash-http",
+      "project": "FairLine",
+      "label": "dashboard :3002",
+      "type": "http",
+      "url": "http://127.0.0.1:3002",
+      "intervalMin": 30,
+      "severity": "warning"
+    },
+    {
+      "id": "arb-bot",
+      "project": "Bots",
+      "label": "sui-arb-bot",
+      "type": "pm2",
+      "processes": ["sui-arb-bot"],
+      "expect": "report",
+      "intervalMin": 30
+    },
+    {
+      "id": "navi-liq-dead",
+      "project": "Bots",
+      "label": "navi-liq stays OFF",
+      "type": "ssh-pm2-absent",
+      "host": "root@139.180.156.63",
+      "sshKey": "~/.ssh/vultr_sg",
+      "process": "navi-liq",
+      "intervalMin": 60,
+      "severity": "critical",
+      "alertUnknown": true,
+      "note": "must stay OFF until flat-fee RPC plan — last accidental run cost $400 in Chainstack overage"
+    }
+  ]
+}

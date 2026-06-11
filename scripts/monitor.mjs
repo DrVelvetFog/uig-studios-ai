@@ -10,6 +10,7 @@ import { execSync }                           from "child_process";
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { homedir }                            from "os";
 import { join }                               from "path";
+import { runOpsChecks }                       from "./ops.mjs";
 
 const HOME       = homedir();
 const TONYAI_DIR = join(HOME, ".tonyai");
@@ -276,10 +277,11 @@ async function main() {
     checkArbBot(),
     checkOllamaModels(),
     checkDiskSpace(),
+    runOpsChecks({ addFinding, notify, run }),
   ]);
 
   results.forEach((r, i) => {
-    const names = ["arb-bot", "ollama-models", "disk-space"];
+    const names = ["arb-bot", "ollama-models", "disk-space", "ops"];
     if (r.status === "rejected") {
       console.error(`[tonyai-monitor] ${names[i]} check failed:`, r.reason?.message || r.reason);
     }
