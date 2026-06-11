@@ -47,10 +47,10 @@
     },
     {
       "id": "hole-site",
-      "project": "Hole in Town",
+      "project": "Gulp City",
       "label": "game site",
       "type": "http",
-      "url": "https://hole-in-town-26352.netlify.app",
+      "url": "https://gulp-city.netlify.app",
       "intervalMin": 30,
       "severity": "warning"
     },
