@@ -13,6 +13,7 @@ import { isCloudModel, cloudProvider, cloudModelId, cloudDisplayName, toOpenAIBo
 import { renderMessage, TypingDots } from "./render.jsx";
 import { DevInspectPanel } from "./components/DevInspectPanel.jsx";
 import { InboxPanel } from "./components/InboxPanel.jsx";
+import { OpsPanel } from "./components/OpsPanel.jsx";
 import { ComparePanel } from "./components/ComparePanel.jsx";
 
 // ── Theme bootstrap — runs at module load, before React mounts ────────────────
@@ -1790,6 +1791,8 @@ export default function App() {
   const [showAgentPanel, setAgentPanel] = useState(false);
   const [showCompare, setShowCompare]   = useState(false);
   const [showInbox, setShowInbox]       = useState(false);
+  const [showOps, setShowOps]           = useState(false);
+  const [opsState, setOpsState]         = useState(null);
   const [inbox, setInbox]               = useState([]);
   // Background processes started via run_background — [{id, command, status, exit_code, elapsed_s}]
   const [bgProcs, setBgProcs]           = useState([]);
@@ -1946,10 +1949,11 @@ export default function App() {
     return () => clearTimeout(t);
   }, [compactNotice]);
 
-  // Poll inbox every 60s so new findings appear without restart
+  // Poll inbox + ops state every 60s so new findings appear without restart
   useEffect(() => {
     const t = setInterval(async () => {
       try { setInbox(JSON.parse(await invoke("read_inbox"))); } catch {}
+      try { setOpsState(JSON.parse(await invoke("read_ops_state"))); } catch {}
     }, 60_000);
     return () => clearInterval(t);
   }, []);
@@ -2544,8 +2548,9 @@ export default function App() {
       });
       setOllamaOk(true);
     } catch { setOllamaOk(false); }
-    // Load monitor inbox
+    // Load monitor inbox + ops state
     try { setInbox(JSON.parse(await invoke("read_inbox"))); } catch {}
+    try { setOpsState(JSON.parse(await invoke("read_ops_state"))); } catch {}
     // Surface background processes a previous app instance left running
     try {
       const orphans = JSON.parse(await invoke("reconcile_orphan_processes"));
@@ -2788,6 +2793,12 @@ export default function App() {
       : "";
     setInput(`[Alert: ${finding.title}]\n${finding.body}${ctx}`);
     setShowInbox(false);
+    setTimeout(() => textareaRef.current?.focus(), 50);
+  }
+
+  function askOpsAbout(promptText) {
+    setInput(promptText);
+    setShowOps(false);
     setTimeout(() => textareaRef.current?.focus(), 50);
   }
 
@@ -4156,6 +4167,26 @@ After getting results, give your final answer in normal markdown. Never include 
             <button onClick={()=>setShowCompare(p=>!p)} className={`header-btn${showCompare?" active":""}`} title="Blind A/B model comparison">Compare</button>
             <button onClick={exportConversation} className="header-btn">Export</button>
             <button onClick={()=>setAgentPanel(p=>!p)} className={`header-btn${showAgentPanel?" active":""}`} title="Search API key & settings">⚙ Search</button>
+            {/* Ops button with down-count badge */}
+            {(() => {
+              const opsChecks = Object.values(opsState?.checks || {});
+              const opsDown   = opsChecks.filter(c => c.status === "down").length;
+              const opsUnknown= opsChecks.filter(c => c.status === "unknown").length;
+              const badge     = opsDown || opsUnknown;
+              return (
+                <button onClick={()=>setShowOps(p=>!p)}
+                  className={`header-btn${showOps?" active":""}`}
+                  style={{ position:"relative" }}
+                  title="Portfolio ops status (background monitor)">
+                  Ops
+                  {badge > 0 && (
+                    <span style={{ position:"absolute", top:-5, right:-5, background: opsDown ? "#ef4444" : "#f97316", color:"#fff", borderRadius:"50%", minWidth:15, height:15, fontSize:9, fontWeight:700, display:"flex", alignItems:"center", justifyContent:"center", padding:"0 3px", lineHeight:1, boxShadow:"0 1px 4px rgba(0,0,0,0.3)" }}>
+                      {badge > 9 ? "9+" : badge}
+                    </span>
+                  )}
+                </button>
+              );
+            })()}
             {/* Alerts button with unread badge */}
             {(() => {
               const unread      = inbox.filter(f => !f.read).length;
@@ -4204,6 +4235,16 @@ After getting results, give your final answer in normal markdown. Never include 
           </div>
         )}
 
+
+        {/* Ops console panel */}
+        {showOps && (
+          <OpsPanel
+            opsState={opsState}
+            onAsk={askOpsAbout}
+            onRefresh={async ()=>{ try { setOpsState(JSON.parse(await invoke("read_ops_state"))); } catch {} }}
+            onClose={()=>setShowOps(false)}
+          />
+        )}
 
         {/* Inbox / Monitor alerts panel */}
         {showInbox && (

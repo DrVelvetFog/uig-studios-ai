@@ -545,6 +545,15 @@ fn save_inbox(data: String) -> Result<(), String> {
     std::fs::write(&path, data).map_err(|e| e.to_string())
 }
 
+// ── Ops console (portfolio check state written by scripts/ops.mjs) ───────────
+
+#[tauri::command]
+fn read_ops_state() -> Result<String, String> {
+    let path = tonyai_dir()?.join("ops-state.json");
+    if !path.exists() { return Ok("{}".to_string()); }
+    std::fs::read_to_string(&path).map_err(|e| e.to_string())
+}
+
 // ── Ollama native commands (bypass WKWebView network stack) ──────────────────
 
 const OLLAMA_URL: &str = "http://127.0.0.1:11434";
@@ -2822,6 +2831,7 @@ pub fn run() {
             append_compare_vote,
             read_inbox,
             save_inbox,
+            read_ops_state,
             ollama_tags,
             ollama_pull,
             ollama_post,
