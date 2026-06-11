@@ -103,6 +103,30 @@
       ],
       "expect": "report",
       "intervalMin": 30
+    },
+    {
+      "id": "por-mainnet-minted",
+      "project": "PoR",
+      "label": "mainnet credentials",
+      "type": "sui-object-field",
+      "rpc": "https://fullnode.mainnet.sui.io:443",
+      "objectId": "0x26873b0ab53768d64fb3b45ef23acfc4e1d49391d73d37331e777191137ed7c1",
+      "field": "total_minted",
+      "intervalMin": 60,
+      "severity": "warning",
+      "growthNote": "Someone minted a PoR credential ON MAINNET"
+    },
+    {
+      "id": "por-mainnet-gas",
+      "project": "PoR",
+      "label": "mainnet gas float",
+      "type": "sui-balance",
+      "rpc": "https://fullnode.mainnet.sui.io:443",
+      "address": "0x9f4d4eeff1807dab5ca657d9bb5cf62db936b196d722dfa3eef0889851532cba",
+      "minBalanceSui": 0.05,
+      "intervalMin": 360,
+      "severity": "warning",
+      "note": "attestor mainnet float \u2014 top up before pilot mints"
     }
   ]
 }
