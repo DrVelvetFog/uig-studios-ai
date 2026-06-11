@@ -12,6 +12,10 @@ import { homedir }                            from "os";
 import { join }                               from "path";
 import { runOpsChecks, runDailyBrief }        from "./ops.mjs";
 
+// launchd runs with a bare PATH (/usr/bin:/bin) — homebrew tools (pm2) and
+// their `#!/usr/bin/env node` shebangs need /opt/homebrew/bin resolvable.
+process.env.PATH = `/opt/homebrew/bin:${process.env.PATH || "/usr/bin:/bin"}`;
+
 const HOME       = homedir();
 const TONYAI_DIR = join(HOME, ".tonyai");
 const INBOX      = join(TONYAI_DIR, "inbox.json");
