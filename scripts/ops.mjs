@@ -93,14 +93,23 @@ async function suiObjectFieldCheck(c) {
   }
 }
 
+// pm2 output can include "[PM2] ..." banner lines (daemon spawn, updates) before
+// the JSON — find the first line that actually parses as a JSON array.
+function parseJlist(out) {
+  for (const line of (out || "").split("\n")) {
+    const t = line.trim();
+    if (t.startsWith("[")) {
+      try { return JSON.parse(t); } catch {}
+    }
+  }
+  return null;
+}
+
 let pm2Cache; // one jlist per monitor run
 function pm2List(run) {
   if (pm2Cache !== undefined) return pm2Cache;
-  try {
-    const out   = run(`${PM2_BIN} jlist`, 20000);
-    const start = out.indexOf("[");
-    pm2Cache = start >= 0 ? JSON.parse(out.slice(start)) : null;
-  } catch { pm2Cache = null; }
+  try { pm2Cache = parseJlist(run(`${PM2_BIN} jlist`, 20000)); }
+  catch { pm2Cache = null; }
   return pm2Cache;
 }
 
@@ -128,11 +137,8 @@ function sshPm2AbsentCheck(c, run) {
     30000
   );
   if (out.includes("MISSING_PM2")) return { status: "up", detail: "no pm2 on box (nothing running)" };
-  const start = out.indexOf("[");
-  if (start < 0) return { status: "unknown", detail: `box unreachable: ${out.trim().slice(0, 120) || "no output"}` };
-  let list;
-  try { list = JSON.parse(out.slice(start)); }
-  catch { return { status: "unknown", detail: "unparseable pm2 output from box" }; }
+  const list = parseJlist(out);
+  if (!list) return { status: "unknown", detail: `box unreachable or unparseable: ${out.trim().slice(0, 120) || "no output"}` };
   const p = list.find(x => x.name === c.process);
   if (!p) return { status: "up", detail: `${c.process} absent on box (good)` };
   const s = p.pm2_env?.status;
@@ -257,4 +263,84 @@ function capHistory() {
     const lines = readFileSync(HISTORY_PATH, "utf8").split("\n").filter(Boolean);
     if (lines.length > 3000) writeFileSync(HISTORY_PATH, lines.slice(-2000).join("\n") + "\n");
   } catch {}
+}
+
+// ── Daily ops brief ───────────────────────────────────────────────────────────
+// One info finding per day, first monitor run at/after BRIEF_HOUR local time.
+// Digest of ops state + last-24h alerts + disk + arb-db freshness, summarized
+// by the local model (llmAnalyze); falls back to the raw digest if Ollama is
+// unavailable, so the brief always lands.
+
+const BRIEF_PATH = join(TONYAI_DIR, "ops-brief.json");
+const BRIEF_SYSTEM = `You are summarizing the daily status of Tony's project portfolio
+(PoR proof-of-personhood, FairLine vault, Hole in Town game, Sui trading bots, this Mac).
+Write like you are texting a friend who runs all of this.
+
+Include exactly:
+1. One word health status (Excellent/Good/Warning/Critical)
+2. Anything DOWN or unknown right now (or "all green")
+3. Biggest problem in the last 24h
+4. One specific thing to do today
+5. Notable numbers (gas wallet, credentials minted, latencies) only if interesting
+
+Under 120 words total. No jargon. Use only the data provided — never invent numbers.`;
+
+export async function runDailyBrief({ addFinding, llmAnalyze, run }) {
+  const briefHour = Number(process.env.TONYAI_BRIEF_HOUR ?? 9);
+  const now = new Date();
+  const dayKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  const briefState = loadJson(BRIEF_PATH, {});
+  if (now.getHours() < briefHour || briefState.lastBriefDay === dayKey) return;
+
+  const lines = [];
+
+  const state = loadJson(STATE_PATH, { checks: {} });
+  const checks = Object.entries(state.checks);
+  if (!checks.length) return; // nothing to brief on yet
+  lines.push("CURRENT STATUS:");
+  for (const [id, v] of checks) lines.push(`- ${v.project} / ${v.label}: ${v.status} (${v.detail})`);
+
+  try {
+    const cutoff = Date.now() - 24 * 3600 * 1000;
+    const inbox = loadJson(join(TONYAI_DIR, "inbox.json"), []);
+    const recent = inbox.filter(f =>
+      new Date(f.timestamp).getTime() > cutoff && f.source !== "ops-daily-brief");
+    if (recent.length) {
+      lines.push("", "ALERTS IN LAST 24H:");
+      recent.slice(0, 8).forEach(f => lines.push(`- [${f.severity}] ${f.title}`));
+    } else {
+      lines.push("", "ALERTS IN LAST 24H: none");
+    }
+  } catch {}
+
+  const df = run("df -h ~ | tail -1");
+  const pct = df.match(/(\d+)%/)?.[1];
+  if (pct) lines.push("", `DISK: ${pct}% used`);
+
+  const arbDb = join(HOME, "sui-arb-ai", "data", "arb-bot.db");
+  if (existsSync(arbDb)) {
+    try {
+      const out = run(`/usr/bin/sqlite3 "${arbDb}" "SELECT COUNT(*), MAX(timestamp) FROM opportunities"`, 10000).trim();
+      const [count, maxTs] = out.split("|").map(Number);
+      if (count > 0 && maxTs) {
+        const ageH = Math.round((Date.now() - (maxTs > 1e12 ? maxTs : maxTs * 1000)) / 3600000);
+        lines.push(`ARB BOT DB: ${count} opportunities recorded, last activity ${ageH}h ago${ageH > 24 ? " (bot idle)" : ""}`);
+      }
+    } catch {}
+  }
+
+  const digest = lines.join("\n");
+  const summary = await llmAnalyze(BRIEF_SYSTEM, digest);
+  const body = summary || digest.slice(0, 900);
+
+  addFinding({
+    source:   "ops-daily-brief",
+    severity: "info",
+    title:    `Daily ops brief — ${dayKey}`,
+    body,
+    context:  digest,
+  }, 20 * 60);
+
+  writeFileSync(BRIEF_PATH, JSON.stringify({ lastBriefDay: dayKey }, null, 2));
+  console.log(`[ops] daily brief posted for ${dayKey}${summary ? "" : " (raw digest — LLM unavailable)"}`);
 }

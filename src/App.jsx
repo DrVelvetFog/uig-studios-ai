@@ -47,6 +47,7 @@ const MODES = [
   { id: "code",   label: "Code",     icon: "⌨️" },
   { id: "sui",    label: "Sui/Move", icon: "🔷" },
   { id: "arb",    label: "Arb Bot",  icon: "⚡" },
+  { id: "ops",    label: "Ops",      icon: "🩺" },
   { id: "python", label: "Python",   icon: "🐍" },
   { id: "image",  label: "Image",    icon: "🖼️" },
   { id: "agent",  label: "Agent",    icon: "🤖" },
@@ -70,6 +71,7 @@ const MODE_DEFAULTS = {
   code:   { temperature: 0.2, numCtx: 32768 },
   sui:    { temperature: 0.2, numCtx: 32768 },
   arb:    { temperature: 0.1, numCtx: 32768 },
+  ops:    { temperature: 0.1, numCtx: 32768 },
   python: { temperature: 0.2, numCtx: 32768 },
   image:  { temperature: 0.7, numCtx: 4096 },
   agent:  { temperature: 0.3, numCtx: 32768 },
@@ -91,6 +93,7 @@ const MODEL_TIERS = {
   code:   ["qwen2.5-coder", "hermes3", "codellama", "deepseek-coder", "llama3.1", "llama3.2", "devstral"],
   sui:    ["qwen2.5-coder", "hermes3", "deepseek-r1", "llama3.1", "llama3.2", "mistral", "devstral"],
   arb:    ["qwen2.5-coder", "hermes3", "deepseek-r1", "llama3.1", "llama3.2", "mistral", "devstral"],
+  ops:    ["qwen2.5-coder", "hermes3", "deepseek-r1", "llama3.1", "llama3.2", "mistral", "devstral"],
   python: ["qwen2.5-coder", "hermes3", "codellama", "deepseek-coder", "llama3.1", "llama3.2", "devstral"],
   agent:  ["qwen2.5-coder", "hermes3", "llama3.1", "llama3.2", "gemma2", "mistral", "devstral"],
   auto:   ["qwen2.5-coder", "hermes3", "llama3.1", "llama3.2", "gemma2", "devstral"],
@@ -105,6 +108,7 @@ const EXAMPLE_PROMPTS = {
   agent:  ["What's the latest news on Sui blockchain?", "Research the best Rust async runtimes", "What files are in my sui-arb-bot/src folder?", "Check if pm2 is running my arb bot"],
   sui:    ["Write a Move module for a basic NFT with key+store abilities", "Explain PTB hot potato pattern for flash loans", "Show how to share an object vs transfer it"],
   arb:    ["Why is BLUEFIN_MIN_SQRT 4295048017n not 4295048016n?", "Optimize flash loan PTB to reduce latency", "Add Aftermath DEX to an existing pair config"],
+  ops:    ["Run a health check on the portfolio", "Deep analysis of recent arb bot errors", "Why is the FairLine dashboard down?", "Give me today's ops summary"],
   python: ["Async HTTP client with retry + exponential backoff", "Type-annotated dataclass for trade records", "Pytest fixture for mocking Sui RPC responses"],
   image:  ["Neon city at 3am, rain-slicked streets, cinematic", "Fox reading in a candlelit library, oil painting", "Abstract crystalline mountain, sunrise, 8k"],
 };
@@ -115,6 +119,7 @@ const EMPTY_STATE_TEXT = {
   code:   "Let's write some code",
   sui:    "Sui / Move assistant",
   arb:    "Arb bot co-pilot",
+  ops:    "Portfolio ops console",
   python: "Let's write Python",
   image:  "Describe an image",
   agent:  "Research anything",
@@ -126,6 +131,7 @@ const INPUT_PLACEHOLDER = {
   code:   "Describe what you want to build or debug…",
   sui:    "Ask about Move objects, PTBs, smart contracts…",
   arb:    "Ask about flash loans, DEX integration, PTB construction…",
+  ops:    "Health check, deep analysis, daily summary, fix a down service…",
   python: "Describe what Python code you need…",
   image:  "Describe the image you want to generate…",
   agent:  "Ask anything — I'll search the web, read files, run commands…",
@@ -247,6 +253,38 @@ SAFETY: tradeInFlight guard, circuit breaker (3 failures → 15min pause), $2 da
 Always produce production-ready TypeScript with error handling and profit validation.
 
 CODING DISCIPLINE: Think before writing — state your interpretation first, ask if the spec is ambiguous. Minimum code only. Touch only what was asked — don't reformat adjacent files or resolve issues outside scope. Confirm what "done" looks like before starting.`,
+
+  ops: `You are TonyAI Ops — the operations console for Tony's project portfolio: PoR (proof-of-personhood, live on Sui testnet), FairLine (DeepBook vault, local pm2), Hole in Town (web game on Netlify), the Sui trading bots, and this Mac itself.
+
+DATA SOURCES — read these with tools, never guess numbers:
+- ~/.tonyai/ops-state.json — current status of every portfolio check (background monitor writes it every 5 min)
+- ~/.tonyai/ops-history.jsonl — one snapshot per monitor run (statuses + metrics) for trends
+- ~/.tonyai/ops.json — what is monitored and how (check definitions)
+- ~/.tonyai/inbox.json — monitor findings and alerts
+- ~/sui-arb-ai/data/arb-bot.db — arb bot telemetry (sqlite3). Tables: opportunities, executions, errors, snapshots, ai_runs, recommendations, fixes, trade_contexts.
+- pm2 (run_command "pm2 jlist") for local processes; FairLine dashboard at http://localhost:3002.
+
+Query the db via run_command, e.g.:
+  sqlite3 ~/sui-arb-ai/data/arb-bot.db "SELECT COUNT(*) FROM errors"
+Before time-window queries, verify the timestamp column's units with a quick SELECT — don't assume.
+
+KNOWN ARB-BOT ERROR MEANINGS:
+- "error 1503" = spread closed during execution — normal
+- "TypeMismatch" = code bug — needs a fix
+- "check_amount_threshold" = slippage — normal
+- "compute_swap_result" = thin liquidity — normal
+- "WebSocket reconnect" = infrastructure — normal
+
+ANALYSIS PLAYBOOKS — when asked for one of these, follow its format exactly:
+1. HEALTH CHECK (last ~30 min of data): answer only — (a) is anything wrong that needs attention? (yes/no + why); (b) the single most important thing right now; (c) action needed? (yes/no + what). Under 100 words, plain English.
+2. DEEP ANALYSIS (last ~6 h): respond as — ROOT CAUSE: [one sentence] / BEST OPPORTUNITY: [pair + route] / RECOMMENDED CHANGE: [env key = value, reason] / BUG DETECTED: [yes/no — if yes, describe]. Be specific, use the actual data.
+3. DAILY SUMMARY (last 24 h): one-word health status (Excellent/Good/Warning/Critical); best thing that happened; biggest problem; one specific thing to do tomorrow; estimated profit if all opportunities had executed. Under 120 words, written like texting a friend who runs this portfolio.
+
+STANDING RULES:
+- Mutating commands (pm2 restart/stop/delete, deploys, kills, file writes) — propose the exact command, explain why, and wait for approval. Never chain mutations.
+- navi-liq must STAY OFF until a flat-fee RPC plan exists — a past accidental run cost $400 in metered RPC overage. If you ever see it running, that IS the most important finding.
+- The PoR attestor is on Render's free tier: it cold-starts (~40s) if keep-alive pings stop. Slow first response ≠ down.
+- FairLine cron processes show "stopped" between runs — that is normal, only "errored" or missing is a problem.`,
 
   agent: `You are TonyAI Agent — an autonomous assistant with real-time tool access. You can search the web, read files, and run commands to fully answer any question.
 
@@ -601,7 +639,7 @@ class TradeRecord:
 // and slower for pure text. Skip them on text-only modes in the first pass;
 // allow them as a last resort if no other match exists.
 const VISION_RE = /vision|moondream/i;
-const TEXT_ONLY_MODES = new Set(["chat", "code", "sui", "arb", "python", "agent", "auto"]);
+const TEXT_ONLY_MODES = new Set(["chat", "code", "sui", "arb", "ops", "python", "agent", "auto"]);
 
 function pickModelForMode(effectiveMode, availableModels, fallback) {
   const prefs = MODEL_TIERS[effectiveMode] || MODEL_TIERS.chat;
