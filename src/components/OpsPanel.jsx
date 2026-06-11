@@ -59,7 +59,7 @@ export function OpsPanel({ opsState, onAsk, onRefresh, onClose }) {
         <span style={{ fontSize: 12, fontWeight: 600, color: "var(--tny-tx2)", letterSpacing: "0.02em" }}>
           Ops
         </span>
-        <span style={{ fontSize: 10, color: "var(--tny-tx4)", fontFamily: "'JetBrains Mono',monospace" }}>
+        <span style={{ fontSize: 10, color: "var(--tny-tx3)", fontFamily: "'JetBrains Mono',monospace" }}>
           {checks.length - down - unknown} up{down > 0 && ` · ${down} down`}{unknown > 0 && ` · ${unknown} unknown`}
           {lastRun > 0 && ` · checked ${age(lastRun)}`}
         </span>
@@ -95,8 +95,8 @@ export function OpsPanel({ opsState, onAsk, onRefresh, onClose }) {
                       <div key={c.id} title={`${c.detail}\nlast change ${age(c.lastChange)}`}
                         style={{ display: "flex", alignItems: "center", gap: 7, minWidth: 0 }}>
                         <Dot status={c.status}/>
-                        <span style={{ fontSize: 11, color: "var(--tny-tx3)", flexShrink: 0 }}>{c.label}</span>
-                        <span style={{ fontSize: 10, color: "var(--tny-tx5)", fontFamily: "'JetBrains Mono',monospace", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", flex: 1, textAlign: "right" }}>
+                        <span style={{ fontSize: 11, color: "var(--tny-tx2)", flexShrink: 0 }}>{c.label}</span>
+                        <span style={{ fontSize: 10, color: "var(--tny-tx3)", fontFamily: "'JetBrains Mono',monospace", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", flex: 1, textAlign: "right" }}>
                           {c.detail}
                         </span>
                         {c.status !== "up" && (
