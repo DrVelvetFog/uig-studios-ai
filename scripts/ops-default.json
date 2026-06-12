@@ -137,6 +137,30 @@
       "intervalMin": 60,
       "severity": "warning",
       "note": "the store shelf \u2014 first revenue product"
+    },
+    {
+      "id": "fairline-operator-gas",
+      "project": "FairLine",
+      "label": "operator gas (0x43a5)",
+      "type": "sui-balance",
+      "rpc": "https://fullnode.testnet.sui.io:443",
+      "address": "0x43a5782881f7ae4584fb7a3d9d9b3cd3440ed634a67301de5e45f734505e8e7d",
+      "minBalanceSui": 0.5,
+      "intervalMin": 60,
+      "severity": "warning",
+      "note": "gases the whole FairLine cron fleet (MM burns ~0.3-0.5/day) + Acre/PoR deploys \u2014 top up at faucet reset"
+    },
+    {
+      "id": "acre-keeper-gas",
+      "project": "Acre",
+      "label": "keeper/attestor gas",
+      "type": "sui-balance",
+      "rpc": "https://fullnode.testnet.sui.io:443",
+      "address": "0xfae1878fb0aa68c5c78ef10b3604036153e323f7e28e4015016e1f27f60a5109",
+      "minBalanceSui": 0.15,
+      "intervalMin": 60,
+      "severity": "warning",
+      "note": "pays 6h tax settles + sponsors walk check-ins; dry keeper = empty pot + dead check-ins"
     }
   ]
 }
