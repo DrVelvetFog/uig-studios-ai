@@ -15,6 +15,11 @@
  *   sui-balance      — suix_getBalance; down when below minBalanceSui. metric = SUI.
  *   sui-object-field — read a u64 field off a shared object; info finding when it
  *                      INCREASES (growth signal, e.g. PoR total_minted). metric = value.
+ *   http-field       — read a numeric dot-path field from a JSON HTTP response (e.g.
+ *                      mints.count off /api/health). gauge; metric = value.
+ *   Any counter check (http-field / sui-object-field) with `maxPerInterval` ALSO gets
+ *   rate-anomaly alerting: a warning (or its severity) when growth in one interval
+ *   exceeds the threshold — mint-volume / L2-accrual spikes. Daily-reset aware.
  *   pm2              — local pm2 process states. expect: "online" | "not-errored" | "report"
  *                      ("report" records status but never alerts).
  *   ssh-pm2-absent   — assert a process is NOT running on a remote box (BatchMode ssh).
@@ -79,6 +84,24 @@ async function suiBalanceCheck(c) {
       : { status: "up",   detail: `${sui.toFixed(3)} SUI`, metric: sui };
   } catch (e) {
     return { status: "unknown", detail: `RPC: ${e.message}` };
+  }
+}
+
+// Read a numeric field (dot-path) out of a JSON HTTP response — e.g. mint volume or
+// L2 accrual off the PoR attestor's /api/health. Pair with `maxPerInterval` for
+// anomaly (rate-spike) alerting in the runner. Gauge: status stays "up" on success.
+function getPath(obj, path) {
+  return String(path).split(".").reduce((o, k) => (o == null ? undefined : o[k]), obj);
+}
+async function httpFieldCheck(c) {
+  try {
+    const res = await fetch(c.url, { signal: AbortSignal.timeout(c.timeoutMs || 15000), redirect: "follow" });
+    if (!res.ok) return { status: "unknown", detail: `HTTP ${res.status}` };
+    const v = Number(getPath(await res.json(), c.field));
+    if (Number.isNaN(v)) return { status: "unknown", detail: `field ${c.field} missing/non-numeric` };
+    return { status: "up", detail: `${c.field} = ${v}`, metric: v };
+  } catch (e) {
+    return { status: "unknown", detail: e.name === "TimeoutError" ? "timeout" : (e.cause?.code || e.message) };
   }
 }
 
@@ -175,6 +198,7 @@ export async function runOpsChecks({ addFinding, notify, run }) {
         case "http":             r = await httpCheck(c); break;
         case "sui-balance":      r = await suiBalanceCheck(c); break;
         case "sui-object-field": r = await suiObjectFieldCheck(c); break;
+        case "http-field":       r = await httpFieldCheck(c); break;
         case "pm2":              r = pm2Check(c, run); break;
         case "ssh-pm2-absent":   r = sshPm2AbsentCheck(c, run); break;
         default:                 r = { status: "unknown", detail: `unknown check type: ${c.type}` };
@@ -190,7 +214,7 @@ export async function runOpsChecks({ addFinding, notify, run }) {
     const label   = c.label || c.id;
 
     // Growth signal: a tracked on-chain counter went up
-    if (c.type === "sui-object-field" &&
+    if (c.type === "sui-object-field" && !(typeof c.maxPerInterval === "number") &&
         typeof prev.metric === "number" && typeof r.metric === "number" && r.metric > prev.metric) {
       addFinding({
         source:   `ops-${c.id}-growth`,
@@ -199,6 +223,26 @@ export async function runOpsChecks({ addFinding, notify, run }) {
         body:     c.growthNote || `On-chain counter increased for ${c.project}.`,
         context:  "",
       }, 1);
+    }
+
+    // Rate anomaly: a tracked counter grew faster than maxPerInterval in one interval
+    // (mint-volume / L2-accrual spike = possible gas-drain / sybil / farming). Works for
+    // http-field and sui-object-field. Daily counters reset to 0, so a drop = a reset:
+    // treat growth as the new value itself (0 → metric) rather than a negative.
+    if (typeof c.maxPerInterval === "number" &&
+        typeof prev.metric === "number" && typeof r.metric === "number") {
+      const growth = r.metric >= prev.metric ? r.metric - prev.metric : r.metric;
+      if (growth > c.maxPerInterval) {
+        const sev = c.severity || "warning";
+        const isNew = addFinding({
+          source:   `ops-${c.id}-anomaly`,
+          severity: sev,
+          title:    `${c.project}: ${label} spike — +${growth} (> ${c.maxPerInterval}/interval)`,
+          body:     (c.anomalyNote || `${label} grew by ${growth} since the last check — unusual rate.`) + (c.note ? ` — ${c.note}` : ""),
+          context:  "",
+        }, 60);
+        if (isNew && sev === "critical") notify(`🟠 ${c.project} anomaly`, `${label}: +${growth} this interval`);
+      }
     }
 
     if (changed && c.expect !== "report") {

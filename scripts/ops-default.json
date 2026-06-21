@@ -46,6 +46,32 @@
       "growthNote": "Someone minted a PoR credential"
     },
     {
+      "id": "por-mint-rate",
+      "project": "PoR",
+      "label": "mint volume",
+      "type": "http-field",
+      "url": "https://por-attestor.onrender.com/api/health",
+      "field": "mints.count",
+      "maxPerInterval": 40,
+      "intervalMin": 15,
+      "severity": "warning",
+      "anomalyNote": "Unusual spike in L0 mints — possible gas-drain / sybil burst. Check attestor logs + gas.",
+      "note": "daily L0 mint counter off /api/health"
+    },
+    {
+      "id": "por-l2-rate",
+      "project": "PoR",
+      "label": "L2 accrual",
+      "type": "http-field",
+      "url": "https://por-attestor.onrender.com/api/health",
+      "field": "actions.count",
+      "maxPerInterval": 25,
+      "intervalMin": 15,
+      "severity": "warning",
+      "anomalyNote": "Unusual spike in L2 real-action grants — possible farming / compromised source.",
+      "note": "daily L2 accrual counter off /api/health (live after the attestor redeploys)"
+    },
+    {
       "id": "hole-site",
       "project": "Gulp City",
       "label": "game site",
