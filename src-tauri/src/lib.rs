@@ -17,9 +17,20 @@ impl StreamCancelMap {
     }
 }
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
+
 // ── Filesystem helpers ────────────────────────────────────────────────────────
+
+/// Home directory that works on unix (HOME) and Windows (USERPROFILE).
+fn home_dir_var() -> Result<String, String> {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| "No home directory: neither HOME nor USERPROFILE is set".to_string())
+}
+
 fn tonyai_dir() -> Result<PathBuf, String> {
-    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+    let home = home_dir_var()?;
     let dir = PathBuf::from(home).join(".tonyai");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir)
@@ -419,7 +430,7 @@ fn append_log(line: String) -> Result<(), String> {
 
 #[tauri::command]
 fn launch_self_update(source_dir: String) -> Result<String, String> {
-    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+    let home = home_dir_var()?;
     if !source_dir.starts_with(&home) {
         return Err("Source directory must be under $HOME".into());
     }
@@ -431,6 +442,12 @@ fn launch_self_update(source_dir: String) -> Result<String, String> {
     std::fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
     let log = log_dir.join("update.log");
 
+    #[cfg(windows)]
+    {
+        let _ = (&script, &log);
+        return Err("Self-update is macOS-only for now — on Windows, git pull and rebuild manually.".into());
+    }
+    #[cfg(not(windows))]
     std::process::Command::new("sh")
         .arg("-c")
         .arg(format!(
@@ -495,7 +512,7 @@ fn read_telemetry() -> Result<String, String> {
 /// Returns JSON object: { "global": "...", "chat": "...", ... }
 #[tauri::command]
 fn read_memory_files() -> Result<String, String> {
-    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+    let home = home_dir_var()?;
     let dir = PathBuf::from(&home).join("TonyAI-Projects").join("memory");
     if !dir.exists() {
         return Ok("{}".to_string());
@@ -521,7 +538,7 @@ fn read_memory_files() -> Result<String, String> {
 /// name must be alphanumeric (e.g. "global", "chat", "code").
 #[tauri::command]
 fn save_memory_file(name: String, content: String) -> Result<(), String> {
-    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+    let home = home_dir_var()?;
     let dir = PathBuf::from(&home).join("TonyAI-Projects").join("memory");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     // Sanitise name — alphanumeric and underscores only
@@ -1309,7 +1326,7 @@ async fn tool_fetch_url(url: String) -> Result<String, String> {
 /// Read a file from disk (home directory only).
 #[tauri::command]
 fn tool_read_file(path: String) -> Result<String, String> {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home_dir_var().unwrap_or_default();
     let allowed_prefixes = [home.as_str(), "/tmp"];
     if !allowed_prefixes.iter().any(|p| path.starts_with(p)) {
         return Err(format!("Access denied: only files under $HOME or /tmp are readable"));
@@ -1330,23 +1347,46 @@ fn tool_read_file(path: String) -> Result<String, String> {
 /// Return the current user's home directory.
 #[tauri::command]
 fn get_home_dir() -> String {
-    std::env::var("HOME").unwrap_or_default()
+    home_dir_var().unwrap_or_default()
 }
 
 /// Hardware facts for model-fit estimation: total RAM + chip name.
 #[tauri::command]
 fn get_hardware_info() -> Result<String, String> {
-    let read_sysctl = |key: &str| -> String {
-        std::process::Command::new("sysctl")
-            .args(["-n", key])
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default()
-    };
-    let ram_bytes: u64 = read_sysctl("hw.memsize").parse().unwrap_or(0);
-    let chip = read_sysctl("machdep.cpu.brand_string");
-    Ok(serde_json::json!({ "ram_bytes": ram_bytes, "chip": chip }).to_string())
+    #[cfg(target_os = "macos")]
+    {
+        let read_sysctl = |key: &str| -> String {
+            std::process::Command::new("sysctl")
+                .args(["-n", key])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        };
+        let ram_bytes: u64 = read_sysctl("hw.memsize").parse().unwrap_or(0);
+        let chip = read_sysctl("machdep.cpu.brand_string");
+        Ok(serde_json::json!({ "ram_bytes": ram_bytes, "chip": chip }).to_string())
+    }
+    #[cfg(windows)]
+    {
+        let read_ps = |query: &str| -> String {
+            std::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", query])
+                .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        };
+        let ram_bytes: u64 = read_ps("(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory")
+            .parse().unwrap_or(0);
+        let chip = read_ps("(Get-CimInstance Win32_Processor).Name");
+        Ok(serde_json::json!({ "ram_bytes": ram_bytes, "chip": chip }).to_string())
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        Ok(serde_json::json!({ "ram_bytes": 0u64, "chip": "" }).to_string())
+    }
 }
 
 /// Search file contents by regex pattern across a directory tree (grep -rn style).
@@ -1362,7 +1402,7 @@ fn tool_search_files(
     use regex::Regex;
     use std::path::PathBuf;
 
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home_dir_var().unwrap_or_default();
     if !dir.starts_with(&home) && !dir.starts_with("/tmp") {
         return Err("Access denied: only dirs under $HOME are searchable".into());
     }
@@ -1481,7 +1521,7 @@ fn tool_search_files(
 /// Creates parent directories if they don't exist.
 #[tauri::command]
 fn tool_write_file(path: String, content: String) -> Result<String, String> {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home_dir_var().unwrap_or_default();
     let allowed_prefixes = [home.as_str(), "/tmp"];
     if !allowed_prefixes.iter().any(|p| path.starts_with(p)) {
         return Err("Access denied: only files under $HOME or /tmp are writable".into());
@@ -1504,7 +1544,7 @@ fn tool_edit_file(
     new_string: String,
     replace_all: Option<bool>,
 ) -> Result<String, String> {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home_dir_var().unwrap_or_default();
     let allowed_prefixes = [home.as_str(), "/tmp"];
     if !allowed_prefixes.iter().any(|p| path.starts_with(p)) {
         return Err("Access denied: only files under $HOME or /tmp are editable".into());
@@ -1598,7 +1638,7 @@ mod edit_file_tests {
 /// List contents of a directory (home directory only).
 #[tauri::command]
 fn tool_list_dir(path: String) -> Result<String, String> {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home_dir_var().unwrap_or_default();
     if !path.starts_with(&home) && !path.starts_with("/tmp") {
         return Err("Access denied: only dirs under $HOME are listable".into());
     }
@@ -1626,7 +1666,7 @@ fn save_generated_image(
 ) -> Result<String, String> {
     use std::io::Write;
 
-    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+    let home = home_dir_var()?;
 
     // Sanitise inputs — no path traversal
     let safe_subdir = subdir.replace(['/', '\\', '.'], "-");
@@ -1662,12 +1702,18 @@ fn save_generated_image(
 /// Open a file or folder in Finder (macOS open command).
 #[tauri::command]
 fn open_path(path: String) -> Result<(), String> {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home_dir_var().unwrap_or_default();
     // Only allow paths under HOME for safety
     if !path.starts_with(&home) && !path.starts_with("/tmp") {
         return Err("Access denied".into());
     }
-    std::process::Command::new("open")
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(windows)]
+    let opener = "explorer";
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let opener = "xdg-open";
+    std::process::Command::new(opener)
         .arg(&path)
         .spawn()
         .map_err(|e| e.to_string())?;
@@ -1679,7 +1725,7 @@ fn open_path(path: String) -> Result<(), String> {
 // must go through tool_run_command which has the permission gate.
 
 async fn run_git(args: Vec<&str>, repo_path: &str) -> Result<String, String> {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home_dir_var().unwrap_or_default();
     if !repo_path.starts_with(&home) && !repo_path.starts_with("/tmp") {
         return Err("Access denied: repo must be under $HOME or /tmp".into());
     }
@@ -1772,17 +1818,21 @@ async fn tool_python_exec(
     packages: Option<String>,    // comma-separated pip packages (optional)
     timeout_seconds: Option<u64>,
 ) -> Result<String, String> {
-    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+    let home = home_dir_var()?;
     let sandbox = std::path::PathBuf::from(&home).join("TonyAI-Sandbox");
     std::fs::create_dir_all(&sandbox).map_err(|e| format!("mkdir sandbox: {e}"))?;
 
     let venv_dir = sandbox.join(".venv");
-    let venv_python = venv_dir.join("bin").join("python3");
-    let venv_pip = venv_dir.join("bin").join("pip");
+    #[cfg(not(windows))]
+    let (venv_bin, py_exe, pip_exe, sys_python) = ("bin", "python3", "pip", "python3");
+    #[cfg(windows)]
+    let (venv_bin, py_exe, pip_exe, sys_python) = ("Scripts", "python.exe", "pip.exe", "python");
+    let venv_python = venv_dir.join(venv_bin).join(py_exe);
+    let venv_pip = venv_dir.join(venv_bin).join(pip_exe);
 
     // Bootstrap venv on first use
     if !venv_python.exists() {
-        let bootstrap = tokio::process::Command::new("python3")
+        let bootstrap = tokio::process::Command::new(sys_python)
             .arg("-m").arg("venv").arg(&venv_dir)
             .output().await
             .map_err(|e| format!("venv bootstrap failed: {e}"))?;
@@ -1853,12 +1903,22 @@ async fn tool_python_exec(
 #[tauri::command]
 async fn tool_run_command(command: String, timeout_seconds: Option<u64>) -> Result<String, String> {
     let timeout_s = timeout_seconds.unwrap_or(30).clamp(1, 600);
+    #[cfg(not(windows))]
+    let mut shell = {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg(&command);
+        c
+    };
+    #[cfg(windows)]
+    let mut shell = {
+        let mut c = tokio::process::Command::new("cmd");
+        c.arg("/C").arg(&command);
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        c
+    };
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_s),
-        tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .output(),
+        shell.output(),
     ).await
     .map_err(|_| format!("Command timed out after {}s. For servers or watch tasks use run_background instead; for long builds pass a larger timeout_seconds (max 600).", timeout_s))?
     .map_err(|e| format!("Failed to run command: {}", e))?;
@@ -1887,7 +1947,7 @@ async fn tool_run_command(command: String, timeout_seconds: Option<u64>) -> Resu
 
 #[tauri::command]
 fn find_project_instructions(path: String) -> Result<String, String> {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home_dir_var().unwrap_or_default();
     if home.is_empty() || (!path.starts_with(&home) && !path.starts_with("/tmp")) {
         return Ok("null".into());
     }
@@ -1993,7 +2053,7 @@ fn ckpt_id_ok(id: &str) -> bool {
 #[tauri::command]
 fn checkpoint_file(turn_id: String, path: String) -> Result<String, String> {
     if !ckpt_id_ok(&turn_id) { return Err("invalid checkpoint id".into()); }
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home_dir_var().unwrap_or_default();
     if !path.starts_with(&home) && !path.starts_with("/tmp") {
         return Err("Access denied: only files under $HOME or /tmp are checkpointable".into());
     }
@@ -2136,27 +2196,57 @@ impl ProcessManager {
 // signal to -pgid reaches the wrapper shell AND everything it forked (npm
 // scripts, dev-server workers, …) — no surviving grandchildren.
 
+#[cfg(unix)]
 fn signal_group(pid: u32, sig: i32) {
     if pid == 0 { return; } // never signal our own group
     unsafe { libc::kill(-(pid as i32), sig); }
 }
 
+#[cfg(unix)]
 async fn kill_group_graceful(pid: u32) {
     signal_group(pid, libc::SIGTERM);
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     signal_group(pid, libc::SIGKILL);
 }
 
+// Windows has no process groups in the unix sense; `taskkill /T` walks the
+// child tree instead, which is the same end: no surviving grandchildren.
+#[cfg(windows)]
+async fn kill_group_graceful(pid: u32) {
+    if pid == 0 { return; }
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output();
+}
+
 fn pid_alive(pid: u32) -> bool {
     if pid == 0 { return false; }
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    #[cfg(unix)]
+    { unsafe { libc::kill(pid as i32, 0) == 0 } }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
+            .unwrap_or(false)
+    }
 }
 
 /// Guard against PID reuse: confirm `pid` is still running (a prefix of) the
 /// command we recorded before treating it as our orphan.
 fn pid_runs_command(pid: u32, command: &str) -> bool {
+    #[cfg(unix)]
     let out = std::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
+        .output();
+    #[cfg(windows)]
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command",
+            &format!("(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine")])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .output();
     let Ok(out) = out else { return false };
     let ps_cmd = String::from_utf8_lossy(&out.stdout);
@@ -2293,9 +2383,18 @@ async fn tool_run_background(
     state: tauri::State<'_, ProcessManager>,
     command: String,
 ) -> Result<String, String> {
+    #[cfg(not(windows))]
     let mut cmd = tokio::process::Command::new("sh");
-    cmd.arg("-c")
-        .arg(&command)
+    #[cfg(not(windows))]
+    cmd.arg("-c");
+    #[cfg(windows)]
+    let mut cmd = tokio::process::Command::new("cmd");
+    #[cfg(windows)]
+    {
+        cmd.arg("/C");
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd.arg(&command)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -2881,14 +2980,25 @@ pub fn run() {
                 if let Some(pm) = app_handle.try_state::<ProcessManager>() {
                     tauri::async_runtime::block_on(async {
                         let mut procs = pm.procs.lock().await;
-                        for (id, p) in procs.iter() {
-                            signal_group(p.pid, libc::SIGTERM);
-                            registry_remove(id);
+                        #[cfg(unix)]
+                        {
+                            for (id, p) in procs.iter() {
+                                signal_group(p.pid, libc::SIGTERM);
+                                registry_remove(id);
+                            }
+                            if !procs.is_empty() {
+                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                for p in procs.values() {
+                                    signal_group(p.pid, libc::SIGKILL);
+                                }
+                            }
                         }
-                        if !procs.is_empty() {
-                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        #[cfg(windows)]
+                        {
+                            let ids: Vec<String> = procs.keys().cloned().collect();
+                            for id in &ids { registry_remove(id); }
                             for p in procs.values() {
-                                signal_group(p.pid, libc::SIGKILL);
+                                kill_group_graceful(p.pid).await;
                             }
                         }
                         procs.clear();
