@@ -6,7 +6,7 @@
  * Sends macOS notifications for critical findings.
  */
 
-import { execSync }                           from "child_process";
+import { execSync, execFileSync }             from "child_process";
 import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { homedir }                            from "os";
 import { join }                               from "path";
@@ -64,10 +64,13 @@ function addFinding({ source, severity, title, body, context = "" }, dedupMinute
 // ── macOS notification ────────────────────────────────────────────────────────
 
 function notify(title, body) {
-  const t = title.replace(/'/g, "").slice(0, 80);
-  const b = body.replace(/'/g, "").slice(0, 200);
+  // AppleScript string literal: escape backslash + double-quote. Passing the
+  // script as an execFileSync arg (no shell) avoids the quoting breakage that
+  // could surface Script Editor on alerts containing " or \.
+  const esc = (s) => '"' + s.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+  const script = `display notification ${esc(body.slice(0, 200))} with title ${esc(title.slice(0, 80))}`;
   try {
-    execSync(`osascript -e 'display notification "${b}" with title "${t}"'`, { timeout: 5000 });
+    execFileSync("osascript", ["-e", script], { timeout: 5000 });
   } catch {}
 }
 
