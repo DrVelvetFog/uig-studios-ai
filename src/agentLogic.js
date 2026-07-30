@@ -137,10 +137,19 @@ export function enrichToolError(fnName, rawError) {
 // Detects whether a prompt needed current information but web search was not used.
 // Used to inject a correction nudge before accepting a final answer.
 export const CURRENT_INFO_RE = /\b(?:current|latest|now|today|right now|price|status|recent|news|update|this week|2024|2025|2026|live|real.?time)\b/i;
+
+// A search that was rate-limited or errored did not check the web, even though the
+// tool call happened. Counting it would let the model satisfy this guard while
+// answering a time-sensitive question from stale knowledge — the exact failure the
+// guard exists to prevent. Matches the "SEARCH DID NOT RUN" / "UNCHECKED" wording
+// the Rust search tool emits for blocked or failed lookups.
+const SEARCH_DID_NOT_RUN_RE = /SEARCH DID NOT RUN|UNCHECKED/i;
+
 export function neededSearchButSkipped(userPrompt, toolSteps) {
   if (!CURRENT_INFO_RE.test(userPrompt)) return false;
   const usedSearch = toolSteps.some(s =>
-    s.name === "web_search" || s.name === "deep_search" || s.name === "fetch_url"
+    (s.name === "web_search" || s.name === "deep_search" || s.name === "fetch_url") &&
+    !SEARCH_DID_NOT_RUN_RE.test(String(s.result ?? ""))
   );
   return !usedSearch;
 }

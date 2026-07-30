@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * TonyAI RAG indexer — builds a semantic search index over your arb bot codebase.
+ * TonyAI RAG indexer — builds a semantic search index over a source tree.
+ * Point SOURCE_DIRS at whatever codebase sui/auto mode should be able to search.
  * Run: node scripts/build-rag-index.mjs
  * Output: ~/.tonyai/rag-index.json
  */
@@ -12,7 +13,7 @@ import os from "os";
 const OLLAMA_URL    = "http://localhost:11434";
 const EMBED_MODEL   = "nomic-embed-text";
 const SOURCE_DIRS   = [
-  "/Users/tonyjagodka/sui-arb-bot/src",
+  "/Users/tonyjagodka/tonyai/src",
 ];
 const SOURCE_EXTS   = new Set([".ts", ".js", ".rs", ".py", ".move"]);
 const CHUNK_SIZE    = 1200;   // chars per chunk

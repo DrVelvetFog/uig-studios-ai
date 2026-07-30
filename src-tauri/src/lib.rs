@@ -37,7 +37,7 @@ fn tonyai_dir() -> Result<PathBuf, String> {
 }
 
 /// ── General Knowledge Base ───────────────────────────────────────────────────
-/// Separate from the arb-bot RAG. Reads any text-based file recursively
+/// Separate from the code RAG index. Reads any text-based file recursively
 /// from a user-configured directory (default: ~/TonyAI-Documents/).
 
 #[tauri::command]
@@ -1151,10 +1151,38 @@ fn ddg_html_scrape(html: &str, query: &str) -> String {
     }
 
     if results.is_empty() {
-        format!("No results scraped for '{}'. Consider adding a Serper.dev or Brave API key for reliable search.", query)
+        format!("DuckDuckGo returned a page with no parseable results for '{}'. This may mean the query genuinely has no hits, or that the result markup changed — treat the web as UNCHECKED rather than empty. Adding a Serper.dev or Brave API key gives reliable search.", query)
     } else {
         results.join("\n\n")
     }
+}
+
+/// Detect DuckDuckGo's rate-limit challenge page.
+///
+/// This is the trap: DDG serves the "are you a bot" CAPTCHA under **HTTP 202**, which
+/// is a 2xx, so `is_success()` is true, the scraper runs against it, finds none of its
+/// selectors, and reports "no results". That is a completely different claim from "the
+/// search did not run" — and the model reasons from it as fact, answering from stale
+/// knowledge while believing it checked. Measured: unkeyed requests start getting 202
+/// after a single query.
+///
+/// We deliberately do NOT try to solve the challenge — defeating bot detection is not
+/// something this app does. We just tell the truth about what happened.
+fn ddg_is_challenge(status: u16, html: &str) -> bool {
+    status == 202
+        || html.contains("anomaly-modal")
+        || html.contains("Please complete the following challenge")
+}
+
+fn ddg_challenge_message(query: &str) -> String {
+    format!(
+        "SEARCH DID NOT RUN — DuckDuckGo rate-limited this request with a bot challenge. \
+         No information about '{}' was retrieved. This is NOT a statement that no results exist: \
+         the web is UNCHECKED for this query, so do not answer as though you had searched. \
+         Either say the search was blocked, or retry later. \
+         A Serper.dev or Brave API key (Settings) avoids this entirely.",
+        query
+    )
 }
 
 /// No-key search via DuckDuckGo HTML, with graceful, descriptive failure.
@@ -1166,12 +1194,16 @@ async fn ddg_search(client: &reqwest::Client, query: &str) -> String {
         .header("Accept-Language", "en-US,en;q=0.9")
         .send().await
     {
-        Ok(resp) if resp.status().is_success() => match resp.text().await {
-            Ok(html) => ddg_html_scrape(&html, query),
-            Err(e)   => format!("Search unavailable (DuckDuckGo read error: {}). Add a Serper.dev or Brave API key for reliable search.", e),
-        },
-        Ok(resp) => format!("Search unavailable (DuckDuckGo HTTP {}). Add a Serper.dev or Brave API key for reliable search.", resp.status()),
-        Err(e)   => format!("Search unavailable (DuckDuckGo unreachable: {}). Add a Serper.dev or Brave API key for reliable search.", e),
+        Ok(resp) if resp.status().is_success() => {
+            let status = resp.status().as_u16();
+            match resp.text().await {
+                Ok(html) if ddg_is_challenge(status, &html) => ddg_challenge_message(query),
+                Ok(html) => ddg_html_scrape(&html, query),
+                Err(e)   => format!("SEARCH DID NOT RUN — DuckDuckGo read error: {}. The web is UNCHECKED for '{}'; do not answer as though you had searched.", e, query),
+            }
+        }
+        Ok(resp) => format!("SEARCH DID NOT RUN — DuckDuckGo HTTP {}. The web is UNCHECKED for '{}'; do not answer as though you had searched. Add a Serper.dev or Brave API key for reliable search.", resp.status(), query),
+        Err(e)   => format!("SEARCH DID NOT RUN — DuckDuckGo unreachable: {}. The web is UNCHECKED for '{}'; do not answer as though you had searched. Add a Serper.dev or Brave API key for reliable search.", e, query),
     }
 }
 
@@ -1194,9 +1226,32 @@ mod search_tests {
     }
 
     #[test]
-    fn empty_html_reports_no_results() {
+    fn empty_html_reports_unchecked_not_empty() {
         let out = ddg_html_scrape("<html><body>nothing here</body></html>", "q");
-        assert!(out.starts_with("No results scraped"), "got: {out}");
+        // Must not let the model conclude the topic has no results.
+        assert!(out.contains("UNCHECKED"), "got: {out}");
+    }
+
+    #[test]
+    fn http_202_is_treated_as_a_challenge_despite_being_2xx() {
+        assert!(ddg_is_challenge(202, "<html>anything</html>"));
+        assert!(!ddg_is_challenge(200, "<html>ordinary results</html>"));
+    }
+
+    #[test]
+    fn challenge_markup_is_caught_even_on_http_200() {
+        // Real body observed when rate-limited (DDG served this under 202, but the
+        // markers are what actually identify it if the status ever changes).
+        let body = r#"<div class="anomaly-modal__body">Please complete the following challenge</div>"#;
+        assert!(ddg_is_challenge(200, body));
+    }
+
+    #[test]
+    fn challenge_message_denies_the_no_results_reading() {
+        let m = ddg_challenge_message("sui gas price");
+        assert!(m.contains("SEARCH DID NOT RUN"), "got: {m}");
+        assert!(m.contains("NOT a statement that no results exist"), "got: {m}");
+        assert!(m.contains("sui gas price"), "got: {m}");
     }
 }
 
@@ -1323,9 +1378,15 @@ async fn tool_fetch_url(url: String) -> Result<String, String> {
     }
 }
 
-/// Read a file from disk (home directory only).
+/// Read a file from disk (home directory only), optionally windowed.
+///
+/// A long file is returned one `limit`-sized window at a time. The truncation
+/// marker names the exact `offset` that continues the read — without it the model
+/// only learns that it saw *some* prefix, and silently reasons over a partial file.
+const READ_FILE_WINDOW: usize = 20000;
+
 #[tauri::command]
-fn tool_read_file(path: String) -> Result<String, String> {
+fn tool_read_file(path: String, offset: Option<usize>, limit: Option<usize>) -> Result<String, String> {
     let home = home_dir_var().unwrap_or_default();
     let allowed_prefixes = [home.as_str(), "/tmp"];
     if !allowed_prefixes.iter().any(|p| path.starts_with(p)) {
@@ -1335,13 +1396,31 @@ fn tool_read_file(path: String) -> Result<String, String> {
     if !p.exists() { return Err(format!("Not found: {}", path)); }
     if p.is_dir()  { return Err(format!("'{}' is a directory — use list_dir instead", path)); }
     let content = std::fs::read_to_string(p).map_err(|e| e.to_string())?;
+
+    // Char-indexed (not byte-indexed) so an offset can never split a UTF-8 sequence.
     let chars: Vec<char> = content.chars().collect();
-    let limit = 20000;
-    Ok(if chars.len() > limit {
-        format!("{}\n\n[...truncated at {} chars]", chars[..limit].iter().collect::<String>(), limit)
-    } else {
-        content
-    })
+    let total  = chars.len();
+    let start  = offset.unwrap_or(0);
+    let window = limit.unwrap_or(READ_FILE_WINDOW).clamp(1, 200_000);
+
+    if start >= total && total > 0 {
+        return Ok(format!("[offset {} is past the end of {} — the file is {} chars]", start, path, total));
+    }
+    let end   = start.saturating_add(window).min(total);
+    let slice: String = chars[start..end].iter().collect();
+
+    let mut out = String::new();
+    if start > 0 {
+        out.push_str(&format!("[resuming {} at char {} of {}]\n\n", path, start, total));
+    }
+    out.push_str(&slice);
+    if end < total {
+        out.push_str(&format!(
+            "\n\n[...truncated at char {} — {} of {} chars remain. Continue with read_file(path, offset={})]",
+            end, total - end, total, end
+        ));
+    }
+    Ok(out)
 }
 
 /// Return the current user's home directory.
@@ -1583,6 +1662,67 @@ fn tool_edit_file(
     std::fs::write(p, &updated).map_err(|e| e.to_string())?;
     let n = if all { count } else { 1 };
     Ok(format!("Replaced {} occurrence{} in {}", n, if n == 1 { "" } else { "s" }, path))
+}
+
+#[cfg(test)]
+mod read_file_tests {
+    use super::*;
+
+    fn tmp_file(name: &str, content: &str) -> String {
+        let path = format!("/tmp/tonyai_test_{}", name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn short_file_returns_bare_content_with_no_markers() {
+        let p = tmp_file("read_short.txt", "alpha\nbeta\n");
+        let r = tool_read_file(p, None, None).unwrap();
+        assert_eq!(r, "alpha\nbeta\n");
+    }
+
+    #[test]
+    fn truncation_marker_names_the_resuming_offset() {
+        let p = tmp_file("read_long.txt", &"x".repeat(50));
+        let r = tool_read_file(p, None, Some(20)).unwrap();
+        assert!(r.starts_with(&"x".repeat(20)));
+        assert!(r.contains("30 of 50 chars remain"), "{r}");
+        assert!(r.contains("offset=20"), "{r}");
+    }
+
+    #[test]
+    fn offset_resumes_exactly_where_the_previous_window_stopped() {
+        let p = tmp_file("read_resume.txt", "0123456789");
+        let first  = tool_read_file(p.clone(), None, Some(4)).unwrap();
+        let second = tool_read_file(p, Some(4), Some(4)).unwrap();
+        assert!(first.starts_with("0123"));
+        assert!(second.contains("4567"), "{second}");
+        assert!(second.contains("at char 4 of 10"), "{second}");
+    }
+
+    #[test]
+    fn final_window_carries_no_truncation_marker() {
+        let p = tmp_file("read_tail.txt", "0123456789");
+        let r = tool_read_file(p, Some(8), Some(4)).unwrap();
+        assert!(r.ends_with("89"), "{r}");
+        assert!(!r.contains("truncated"), "{r}");
+    }
+
+    #[test]
+    fn offset_past_eof_explains_itself_instead_of_returning_empty() {
+        let p = tmp_file("read_past.txt", "short");
+        let r = tool_read_file(p, Some(999), None).unwrap();
+        assert!(r.contains("past the end"), "{r}");
+        assert!(r.contains("5 chars"), "{r}");
+    }
+
+    #[test]
+    fn multibyte_content_is_split_on_char_boundaries() {
+        // Byte-indexing "日本語テキスト" at 4 would panic mid-sequence; char-indexing must not.
+        let p = tmp_file("read_utf8.txt", "日本語テキスト");
+        let r = tool_read_file(p, Some(2), Some(2)).unwrap();
+        assert!(r.contains("語テ"), "{r}");
+    }
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 /**
  * Auto-router: classify a user prompt into a TonyAI mode.
  * Pure function — no side effects, no imports.
- * Returned values: "image" | "arb" | "sui" | "python" | "code" | "chat"
+ * Returned values: "image" | "sui" | "python" | "code" | "chat"
  */
 export function classifyPrompt(prompt) {
   const p = prompt.toLowerCase();
@@ -24,16 +24,16 @@ export function classifyPrompt(prompt) {
     return "image";
   }
 
-  // ── Arb bot ───────────────────────────────────────────────────────────────
-  if (/\b(?:flash.?loan|flash.?exec|arb.?bot|arbitrag|pairs\.ts|monitor\.ts|flash.?executor|navi.?flash|sui.?arb)\b/i.test(p) ||
-      /\b(?:turbos|bluefin|cetus|momentum)\b.{0,40}\b(?:swap|pool|route|pair|arb|dex|liquidity)\b/i.test(p) ||
+  // ── Sui / Move (includes DeFi + DEX integration) ──────────────────────────
+  // The DEX/flash-loan patterns used to route to a dedicated "arb" mode built around
+  // one specific bot. That bot is dead; the protocol knowledge is not, so these now
+  // land in sui mode alongside Move. Patterns that were purely about operating that
+  // bot (pm2 restart, smoke test, circuit breaker, daily loss cap) are gone — they
+  // were never about Sui development.
+  if (/\b(?:flash.?loan|flash.?exec|arbitrag|flash.?executor|navi.?flash)\b/i.test(p) ||
+      /\b(?:turbos|bluefin|cetus|momentum|deepbook)\b.{0,40}\b(?:swap|pool|route|pair|dex|liquidity)\b/i.test(p) ||
       /\bNAVI_PKG\b|\bNAVI_STORAGE\b|\bflash_loan_with_ctx|\bflash_repay\b/i.test(p) ||
-      /\b(?:pm2 restart|smoke test|trade.?in.?flight|circuit breaker|daily.?loss.?cap)\b/i.test(p)) {
-    return "arb";
-  }
-
-  // ── Sui / Move ────────────────────────────────────────────────────────────
-  if (/\b(?:move module|sui object|ptb|programmable.?transactions?|hot potato|sui nft|move struct|tx_context|has key|has store|has copy|has drop|transfer::transfer|sui::object|object::new|init\s*\(|one.?time.?witness|otw)\b/i.test(p) ||
+      /\b(?:move module|sui object|ptb|programmable.?transactions?|hot potato|sui nft|move struct|tx_context|has key|has store|has copy|has drop|transfer::transfer|sui::object|object::new|init\s*\(|one.?time.?witness|otw)\b/i.test(p) ||
       /\b(?:sui blockchain|move lang(?:uage)?|sui smart contract|sui defi|sui wallet|sui token|sui coin|sui package|sui framework)\b/i.test(p)) {
     return "sui";
   }

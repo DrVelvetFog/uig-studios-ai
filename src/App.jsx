@@ -10,6 +10,7 @@ import { installGlobalErrorLogging, logError } from "./logger.js";
 import { hybridRetrieve } from "./retrieval.js";
 import { modelFit, FIT_DOT } from "./modelFit.js";
 import { isCloudModel, cloudProvider, cloudModelId, cloudDisplayName, toOpenAIBody } from "./cloud.js";
+import { estimateTokens, observeTokenRatio, serializeTokenRatios, loadTokenRatios } from "./tokens.js";
 import { renderMessage, TypingDots } from "./render.jsx";
 import { DevInspectPanel } from "./components/DevInspectPanel.jsx";
 import { InboxPanel } from "./components/InboxPanel.jsx";
@@ -46,7 +47,6 @@ const MODES = [
   { id: "chat",   label: "Chat",     icon: "💬" },
   { id: "code",   label: "Code",     icon: "⌨️" },
   { id: "sui",    label: "Sui/Move", icon: "🔷" },
-  { id: "arb",    label: "Arb Bot",  icon: "⚡" },
   { id: "ops",    label: "Ops",      icon: "🩺" },
   { id: "python", label: "Python",   icon: "🐍" },
   { id: "image",  label: "Image",    icon: "🖼️" },
@@ -70,7 +70,6 @@ const MODE_DEFAULTS = {
   chat:   { temperature: 0.7, numCtx: 32768 },
   code:   { temperature: 0.2, numCtx: 32768 },
   sui:    { temperature: 0.2, numCtx: 32768 },
-  arb:    { temperature: 0.1, numCtx: 32768 },
   ops:    { temperature: 0.1, numCtx: 32768 },
   python: { temperature: 0.2, numCtx: 32768 },
   image:  { temperature: 0.7, numCtx: 4096 },
@@ -92,7 +91,6 @@ const MODEL_TIERS = {
   chat:   ["llama3.2", "llama3.1", "llama3", "gemma3", "gemma2", "qwen2.5", "mistral", "phi"],
   code:   ["qwen2.5-coder", "hermes3", "codellama", "deepseek-coder", "llama3.1", "llama3.2", "devstral"],
   sui:    ["qwen2.5-coder", "hermes3", "deepseek-r1", "llama3.1", "llama3.2", "mistral", "devstral"],
-  arb:    ["qwen2.5-coder", "hermes3", "deepseek-r1", "llama3.1", "llama3.2", "mistral", "devstral"],
   ops:    ["qwen2.5-coder", "hermes3", "deepseek-r1", "llama3.1", "llama3.2", "mistral", "devstral"],
   python: ["qwen2.5-coder", "hermes3", "codellama", "deepseek-coder", "llama3.1", "llama3.2", "devstral"],
   agent:  ["qwen2.5-coder", "hermes3", "llama3.1", "llama3.2", "gemma2", "mistral", "devstral"],
@@ -105,10 +103,9 @@ const EXAMPLE_PROMPTS = {
   auto:   ["Why is my flash loan failing?", "Write an async Python retry helper", "Neon city at 3am, cinematic", "Explain the Move hot potato pattern"],
   chat:   ["Explain quantum entanglement simply", "Best way to learn Rust?", "Write a poem about fog"],
   code:   ["Write a Python web scraper", "Debug this React hook", "Convert to TypeScript"],
-  agent:  ["What's the latest news on Sui blockchain?", "Research the best Rust async runtimes", "What files are in my sui-arb-bot/src folder?", "Check if pm2 is running my arb bot"],
+  agent:  ["What's the latest news on Sui blockchain?", "Research the best Rust async runtimes", "What files are in my tonyai/src folder?", "Check which pm2 processes are running"],
   sui:    ["Write a Move module for a basic NFT with key+store abilities", "Explain PTB hot potato pattern for flash loans", "Show how to share an object vs transfer it"],
-  arb:    ["Why is BLUEFIN_MIN_SQRT 4295048017n not 4295048016n?", "Optimize flash loan PTB to reduce latency", "Add Aftermath DEX to an existing pair config"],
-  ops:    ["Run a health check on the portfolio", "Deep analysis of recent arb bot errors", "Why is the FairLine dashboard down?", "Give me today's ops summary"],
+  ops:    ["Run a health check on the portfolio", "Deep analysis of the last 6h of alerts", "Why is the FairLine dashboard down?", "Give me today's ops summary"],
   python: ["Async HTTP client with retry + exponential backoff", "Type-annotated dataclass for trade records", "Pytest fixture for mocking Sui RPC responses"],
   image:  ["Neon city at 3am, rain-slicked streets, cinematic", "Fox reading in a candlelit library, oil painting", "Abstract crystalline mountain, sunrise, 8k"],
 };
@@ -118,7 +115,6 @@ const EMPTY_STATE_TEXT = {
   chat:   "Ask me anything",
   code:   "Let's write some code",
   sui:    "Sui / Move assistant",
-  arb:    "Arb bot co-pilot",
   ops:    "Portfolio ops console",
   python: "Let's write Python",
   image:  "Describe an image",
@@ -130,7 +126,6 @@ const INPUT_PLACEHOLDER = {
   chat:   "Ask anything…",
   code:   "Describe what you want to build or debug…",
   sui:    "Ask about Move objects, PTBs, smart contracts…",
-  arb:    "Ask about flash loans, DEX integration, PTB construction…",
   ops:    "Health check, deep analysis, daily summary, fix a down service…",
   python: "Describe what Python code you need…",
   image:  "Describe the image you want to generate…",
@@ -217,63 +212,38 @@ module pkg::my_module {
 \`\`\`
 Always produce compilable Move code with explicit type annotations.
 
-CODING DISCIPLINE: Think before writing — state your interpretation first, ask if unclear. Minimum code only. Touch only what was asked — don't reformat adjacent modules or fix unrelated issues silently. Confirm what "done" means before starting.`,
+DEX / DEFI INTEGRATION — hard-won gotchas, each one cost a debugging session:
+- BLUEFIN_MIN_SQRT = 4295048017n (NOT 4295048016 — off-by-one causes MoveAbort 1009)
+- Turbos swap_a_b_with_return_ → (Coin<B> output, Coin<A> leftover) — output is the FIRST result
+- Cetus SUI/USDC: coinA=USDC, coinB=SUI (REVERSED vs pair order) → a2b=true means USDC→SUI.
+  Always check a Cetus pool's coin ordering; do not assume it matches the pair name.
+- Bluefin SUI/USDC: Pool<SUI,USDC>, same as pair order → no type-arg override needed
+- Q64.64 sqrt price: use BigInt(sqrtPrice) >> 32n before converting to float
+- Bluefin package 0xd075338d105482f1527cbfd363d6413558f184dec36d9138a70261e87f486e9c (gateway::route_swap)
+- Cetus package 0xb2db7142fa83210a7d78d9c12ac49c043b3cbbd482224fea6e3da00aa5a5ae2d
 
-  arb: `You are an expert in Sui DeFi arbitrage bot development. You have deep knowledge of this specific bot at /Users/tonyjagodka/sui-arb-bot/.
-
-ARCHITECTURE: TypeScript, 500ms polling, 4 pairs × 4 DEXes, NAVI v2 flash loans (~100ms PTB).
-Files: src/monitor.ts (main loop), src/executor.ts (wallet trades), src/flash-executor.ts (NAVI flash loans), src/pairs.ts (config), src/classify.ts (error classification).
-Run: pm2 restart sui-arb-bot | Smoke test: npm run smoke (all 22 routes must pass).
-
-ACTIVE PAIRS: SUI/USDC (Turbos+Bluefin+Momentum+Cetus), DEEP/USDC (Turbos+Bluefin), DEEP/SUI (Turbos+Momentum, flash enabled), WAL/SUI (Turbos+Bluefin+Momentum, flash enabled).
-
-NAVI FLASH LOANS (SDK bypassed — direct Move calls, was 3200ms now ~100ms):
-- NAVI_PKG: 0x81c408448d0d57b3e371ea94de1d40bf852784d3e225de1e74acab3e8395c18f
-- NAVI_FLASHLOAN_CONFIG: 0x3672b2bf471a60c30a03325f104f92fb195c9d337ba58072dce764fe2aa5e2dc
-- NAVI_STORAGE: 0xbb4e2f4b6205c2e2a2db47aeb4f830796ec7c005f88537ee775986639bc442fe
+NAVI FLASH LOANS (call the Move functions directly — the SDK costs ~3200ms of HTTP per invocation):
+- NAVI_PKG 0x81c408448d0d57b3e371ea94de1d40bf852784d3e225de1e74acab3e8395c18f
+- NAVI_FLASHLOAN_CONFIG 0x3672b2bf471a60c30a03325f104f92fb195c9d337ba58072dce764fe2aa5e2dc
+- NAVI_STORAGE 0xbb4e2f4b6205c2e2a2db47aeb4f830796ec7c005f88537ee775986639bc442fe
 - v2 mainnet: flash_loan_with_ctx_v2(flashloanConfig, pool, amount:u64, 0x05) → [Balance<T>, Receipt]
 - repay: flash_repay_with_ctx(0x06:clock, storage, pool, receipt, repayBalance)
-- PTB flow: naviFlashBorrow → balanceToCoin → [buy leg] → [sell leg] → mergeCoins → coinToBalance → naviFlashRepay → balanceToCoin → transferObjects
-- NAVI fee: 0% (NAVI_FEE_RATE = 0). Full TX reverts if repay insufficient — zero capital risk.
+- Borrow returns Balance<T>, not Coin<T> — balanceToCoin before any DEX swap, coinToBalance before repaying
+- Fee is 0%. The whole TX reverts if the repay is short, so a failed loan risks gas only.
+- Verify the on-chain protocol version before trusting these signatures; NAVI has shipped breaking v1→v2 changes.
 
-CRITICAL GOTCHAS:
-- BLUEFIN_MIN_SQRT = 4295048017n (NOT 4295048016 — off-by-one causes MoveAbort 1009)
-- Turbos swap_a_b_with_return_ → (Coin<B> output, Coin<A> leftover) — output is FIRST result
-- Cetus SUI/USDC: coinA=USDC, coinB=SUI (REVERSED) → cetusPoolTypeArgs: [USDC, SUI], a2b=true = USDC→SUI
-- Bluefin SUI/USDC: Pool<SUI,USDC> same as pair order → NO bluefinPoolTypeArgs override needed
-- NAVI returns Balance<T> not Coin<T> — must call balanceToCoin before DEX swaps
-- naviFlashRepay expects Balance<T> — must call coinToBalance before repaying
-- Q64.64 sqrt price: use BigInt(sqrtPrice) >> 32n before float conversion
+CODING DISCIPLINE: Think before writing — state your interpretation first, ask if unclear. Minimum code only. Touch only what was asked — don't reformat adjacent modules or fix unrelated issues silently. Confirm what "done" means before starting.`,
 
-DEX PACKAGES:
-- Bluefin: 0xd075338d105482f1527cbfd363d6413558f184dec36d9138a70261e87f486e9c, gateway::route_swap
-- Cetus: 0xb2db7142fa83210a7d78d9c12ac49c043b3cbbd482224fea6e3da00aa5a5ae2d
-
-SAFETY: tradeInFlight guard, circuit breaker (3 failures → 15min pause), $2 daily loss cap, flash tier 1–8 ($10→$5000).
-Always produce production-ready TypeScript with error handling and profit validation.
-
-CODING DISCIPLINE: Think before writing — state your interpretation first, ask if the spec is ambiguous. Minimum code only. Touch only what was asked — don't reformat adjacent files or resolve issues outside scope. Confirm what "done" looks like before starting.`,
-
-  ops: `You are TonyAI Ops — the operations console for Tony's project portfolio: PoR (proof-of-personhood, live on Sui testnet), FairLine (DeepBook vault, local pm2), Hole in Town (web game on Netlify), the Sui trading bots, and this Mac itself.
+  ops: `You are TonyAI Ops — the operations console for Tony's project portfolio: PoR (proof-of-personhood, live on Sui testnet), FairLine (DeepBook vault, local pm2), Hole in Town (web game on Netlify), the sui-x402 facilitator, and this Mac itself.
 
 DATA SOURCES — read these with tools, never guess numbers:
 - ~/.tonyai/ops-state.json — current status of every portfolio check (background monitor writes it every 5 min)
 - ~/.tonyai/ops-history.jsonl — one snapshot per monitor run (statuses + metrics) for trends
 - ~/.tonyai/ops.json — what is monitored and how (check definitions)
 - ~/.tonyai/inbox.json — monitor findings and alerts
-- ~/sui-arb-ai/data/arb-bot.db — arb bot telemetry (sqlite3). Tables: opportunities, executions, errors, snapshots, ai_runs, recommendations, fixes, trade_contexts.
-- pm2 (run_command "pm2 jlist") for local processes; FairLine dashboard at http://localhost:3002.
+- pm2 (run_command "pm2 jlist") for local processes.
 
-Query the db via run_command, e.g.:
-  sqlite3 ~/sui-arb-ai/data/arb-bot.db "SELECT COUNT(*) FROM errors"
-Before time-window queries, verify the timestamp column's units with a quick SELECT — don't assume.
-
-KNOWN ARB-BOT ERROR MEANINGS:
-- "error 1503" = spread closed during execution — normal
-- "TypeMismatch" = code bug — needs a fix
-- "check_amount_threshold" = slippage — normal
-- "compute_swap_result" = thin liquidity — normal
-- "WebSocket reconnect" = infrastructure — normal
+Before any time-window query against a data file, verify the timestamp column's units with a quick SELECT — don't assume.
 
 ANALYSIS PLAYBOOKS — when asked for one of these, follow its format exactly:
 1. HEALTH CHECK (last ~30 min of data): answer only — (a) is anything wrong that needs attention? (yes/no + why); (b) the single most important thing right now; (c) action needed? (yes/no + what). Under 100 words, plain English.
@@ -291,7 +261,7 @@ STANDING RULES:
 AVAILABLE TOOLS:
 - web_search(query): Search the internet for current information, news, docs, prices, research
 - fetch_url(url): Fetch and read the full text of any URL (follow up search results with this)
-- read_file(path): Read a file from the local filesystem (restricted to $HOME)
+- read_file(path, offset?, limit?): Read a file from the local filesystem (restricted to $HOME). Long files return one window at a time — if the result ends in a truncation marker, read the rest with the offset it names rather than reasoning from the partial file
 - list_dir(path): List contents of a directory
 - run_command(command): Execute a shell command (pm2, git, npm, curl, etc.)
 - write_file(path, content): Create a NEW file
@@ -376,7 +346,7 @@ AVOID: silent assumptions, heavy boilerplate, scope creep into neighboring files
 const SNIPPETS = [
   {
     label: "NAVI v2 flash loan skeleton",
-    mode: "arb",
+    mode: "sui",
     code: `const txb = new Transaction();
 txb.setGasBudget(50_000_000n);
 
@@ -438,7 +408,7 @@ txb.transferObjects([surplusCoin], txb.pure.address(WALLET_ADDRESS));`,
   },
   {
     label: "devInspect wrapper",
-    mode: "arb",
+    mode: "sui",
     code: `const result = await suiClient.devInspectTransactionBlock({
   transactionBlock: txb,
   sender: WALLET_ADDRESS,
@@ -456,7 +426,7 @@ console.log('Return values:', JSON.stringify(result.results, null, 2));`,
   },
   {
     label: "Turbos buy+sell pair",
-    mode: "arb",
+    mode: "sui",
     code: `// Turbos A→B (buy leg)
 const [coinB, leftoverA] = txb.moveCall({
   target: \`\${TURBOS_PKG}::pool_fetcher::swap_a_b_with_return_\`,
@@ -639,7 +609,7 @@ class TradeRecord:
 // and slower for pure text. Skip them on text-only modes in the first pass;
 // allow them as a last resort if no other match exists.
 const VISION_RE = /vision|moondream/i;
-const TEXT_ONLY_MODES = new Set(["chat", "code", "sui", "arb", "ops", "python", "agent", "auto"]);
+const TEXT_ONLY_MODES = new Set(["chat", "code", "sui", "ops", "python", "agent", "auto"]);
 
 function pickModelForMode(effectiveMode, availableModels, fallback) {
   const prefs = MODEL_TIERS[effectiveMode] || MODEL_TIERS.chat;
@@ -665,8 +635,8 @@ function pickModelForMode(effectiveMode, availableModels, fallback) {
 }
 
 // ── Theme accent maps ─────────────────────────────────────────────────────────
-const DARK_ACCENTS  = { auto:"#a78bfa", chat:"#60a5fa", code:"#9b7fe8", sui:"#c4b5fd", arb:"#fbbf24", python:"#4ade80", image:"#fb923c", agent:"#38bdf8" };
-const LIGHT_ACCENTS = { auto:"#6b4fbf", chat:"#2563eb", code:"#6b4fbf", sui:"#7c3aed", arb:"#d97706", python:"#16a34a", image:"#ea580c", agent:"#0284c7" };
+const DARK_ACCENTS  = { auto:"#a78bfa", chat:"#60a5fa", code:"#9b7fe8", sui:"#c4b5fd", python:"#4ade80", image:"#fb923c", agent:"#38bdf8" };
+const LIGHT_ACCENTS = { auto:"#6b4fbf", chat:"#2563eb", code:"#6b4fbf", sui:"#7c3aed", python:"#16a34a", image:"#ea580c", agent:"#0284c7" };
 
 // ── Auto-router ───────────────────────────────────────────────────────────────
 // classifyPrompt imported from ./classifyPrompt.js
@@ -1148,7 +1118,6 @@ const MODE_TOOL_SETS = {
   code:   ["web_search", "deep_search", "fetch_url", "propose_plan", "write_file", "edit_file", "read_file", "search_files", "list_dir", "run_command", "run_background", "process_status", "process_kill", "process_list", "python_exec", "git_status", "git_diff", "git_log", "git_blame", "spawn_subagent", "search_knowledge", "search_sessions"],
   python: ["web_search", "deep_search", "fetch_url", "propose_plan", "write_file", "edit_file", "read_file", "search_files", "list_dir", "run_command", "run_background", "process_status", "process_kill", "process_list", "python_exec", "git_status", "git_diff", "git_log", "git_blame", "spawn_subagent", "search_knowledge", "search_sessions"],
   sui:    ["web_search", "deep_search", "fetch_url", "propose_plan", "write_file", "edit_file", "read_file", "search_files", "list_dir", "run_command", "run_background", "process_status", "process_kill", "process_list", "python_exec", "git_status", "git_diff", "git_log", "git_blame", "spawn_subagent", "search_knowledge", "search_sessions"],
-  arb:    ["web_search", "deep_search", "fetch_url", "propose_plan", "write_file", "edit_file", "read_file", "search_files", "list_dir", "run_command", "run_background", "process_status", "process_kill", "process_list", "python_exec", "git_status", "git_diff", "git_log", "git_blame", "spawn_subagent", "search_knowledge", "search_sessions"],
   agent:  null,   // full AGENT_TOOLS — unrestricted orchestrator
   auto:   null,   // resolved at runtime to classified effectiveMode set
   image:  [],     // no text tools — handled by A1111/ComfyUI backends
@@ -1320,7 +1289,7 @@ async function runSubagent({ role, task, model, signal, braveApiKey, onProgress,
             }
             if      (fnName === "web_search")   toolResult = await invoke("tool_web_search",   { query: fnArgs.query,   braveApiKey: braveApiKey||"" });
             else if (fnName === "fetch_url")    toolResult = wrapUntrustedContent(fnArgs.url, await invoke("tool_fetch_url", { url: fnArgs.url }));
-            else if (fnName === "read_file")    toolResult = await invoke("tool_read_file",    { path: fnArgs.path });
+            else if (fnName === "read_file")    toolResult = await invoke("tool_read_file",    { path: fnArgs.path, offset: fnArgs.offset ?? null, limit: fnArgs.limit ?? null });
             else if (fnName === "list_dir")     toolResult = await invoke("tool_list_dir",     { path: fnArgs.path });
             else if (fnName === "search_files") toolResult = await invoke("tool_search_files", { dir: fnArgs.dir, pattern: fnArgs.pattern, extensions: fnArgs.extensions ?? null, maxResults: fnArgs.max_results ?? null });
             else if (fnName === "run_command")  toolResult = await invoke("tool_run_command",  { command: fnArgs.command, timeoutSeconds: null });
@@ -1477,7 +1446,7 @@ const AGENT_TOOLS = [
   { type:"function", function:{ name:"web_search",  description:"Search the internet for current information, news, research, documentation, prices. Returns titles, URLs, and snippets. Use deep_search if you need full page content.", parameters:{ type:"object", properties:{ query:{ type:"string", description:"The search query" }}, required:["query"] }}},
   { type:"function", function:{ name:"deep_search", description:"Search the internet AND automatically fetch the full content of the top results. Use this for any question needing current, detailed information — prices, news, documentation, tutorials. More thorough than web_search alone.", parameters:{ type:"object", properties:{ query:{ type:"string", description:"What to search for" }, num_results:{ type:"number", description:"How many top results to fetch in full (default 2, max 4)" }}, required:["query"] }}},
   { type:"function", function:{ name:"fetch_url",   description:"Fetch and read the full text content of a specific URL. Use after web_search to get full page details.", parameters:{ type:"object", properties:{ url:{ type:"string", description:"The URL to fetch" }}, required:["url"] }}},
-  { type:"function", function:{ name:"read_file",   description:"Read the contents of a local file. Only files under $HOME are accessible.", parameters:{ type:"object", properties:{ path:{ type:"string", description:"Absolute path to the file" }}, required:["path"] }}},
+  { type:"function", function:{ name:"read_file",   description:"Read the contents of a local file. Only files under $HOME are accessible. Long files come back one 20000-char window at a time; if the result ends in a truncation marker, call again with the offset it names to read the rest.", parameters:{ type:"object", properties:{ path:{ type:"string", description:"Absolute path to the file" }, offset:{ type:"number", description:"Character offset to start reading from (default 0). Use the offset named in a truncation marker to continue a long file." }, limit:{ type:"number", description:"Max characters to return (default 20000)." }}, required:["path"] }}},
   { type:"function", function:{ name:"list_dir",    description:"List files and subdirectories in a local directory.", parameters:{ type:"object", properties:{ path:{ type:"string", description:"Absolute path to the directory" }}, required:["path"] }}},
   { type:"function", function:{ name:"run_command", description:"Run a shell command and return its output. Use for pm2, git, npm, ls, curl, python3, node, etc. Default timeout 30s — pass timeout_seconds (max 600) for long builds or test suites. For servers / watch tasks that never exit, use run_background instead.", parameters:{ type:"object", properties:{ command:{ type:"string", description:"Shell command to execute" }, timeout_seconds:{ type:"number", description:"Max seconds to wait (default 30, max 600)" }}, required:["command"] }}},
   { type:"function", function:{ name:"run_background", description:"Start a LONG-RUNNING shell command in the background (dev server, watch task, long build) and return immediately with a process id. The command keeps running — use process_status(id) to read its output and process_kill(id) to stop it. Always kill servers you started when the task is done.", parameters:{ type:"object", properties:{ command:{ type:"string", description:"Shell command to run in the background" }}, required:["command"] }}},
@@ -1500,9 +1469,15 @@ const AGENT_TOOLS = [
 
 const TOOL_ICONS = { web_search:"🔍", deep_search:"🔎🌐", fetch_url:"🌐", read_file:"📄", write_file:"✍️", edit_file:"✂️", search_files:"🔎", list_dir:"📁", run_command:"⚡", run_background:"🔄", process_status:"📊", process_kill:"🛑", process_list:"📋", propose_plan:"🗒️", spawn_subagent:"🤖", search_knowledge:"📚", search_sessions:"🗂️", python_exec:"🐍", git_status:"🌿", git_diff:"📝", git_log:"📜", git_blame:"👤", fixer:"🔧" };
 
-// ── Context token estimation (chars ÷ 4 ≈ tokens) ────────────────────────────
-function estimateTokens(...textParts) {
-  return Math.ceil(textParts.reduce((sum, t) => sum + (t || "").length, 0) / 4);
+// Context token estimation lives in tokens.js — it calibrates itself per model from
+// the prompt_eval_count Ollama reports on every response.
+
+// Fold a finished response's ground-truth prompt size into the model's ratio and
+// persist it, so the estimate is already calibrated on the next launch.
+function recordPromptTokens(model, promptChars, promptTokens) {
+  if (observeTokenRatio(model, promptChars, promptTokens) === null) return;
+  try { localStorage.setItem("tonyai-token-ratios", JSON.stringify(serializeTokenRatios())); }
+  catch { /* quota/private-mode — the in-memory ratio still applies this session */ }
 }
 
 // ── Tool step message component ───────────────────────────────────────────────
@@ -1667,6 +1642,8 @@ export default function App() {
     if (!stored) return [makeSession("auto")];
     // Migrate any sessions stuck in non-auto modes (chat, code, python, sui, arb, agent) to auto.
     // Image mode is kept since it's genuinely different (A1111/ComfyUI).
+    // "arb" is a RETIRED mode and must stay in this set — sessions saved before it was
+    // removed still carry mode:"arb" on disk, and this is what lands them somewhere real.
     const NON_AUTO = new Set(["chat","code","python","sui","arb","agent"]);
     const migrated = stored.map(s => NON_AUTO.has(s.mode) ? { ...s, mode:"auto" } : s);
     if (migrated.some((s,i) => s.mode !== stored[i].mode)) persistSessions(migrated);
@@ -1879,7 +1856,7 @@ export default function App() {
   // Discovered tools from running MCP servers: { [serverId]: McpTool[] }
   const [mcpDiscoveredTools, setMcpDiscoveredTools] = useState({});
   const [showMcpPanel, setShowMcpPanel] = useState(false);
-  const [ragSourceDir, setRagSourceDir] = useState(() => localStorage.getItem("tonyai-rag-dir") || "/Users/tonyjagodka/sui-arb-bot/src");
+  const [ragSourceDir, setRagSourceDir] = useState(() => localStorage.getItem("tonyai-rag-dir") || "/Users/tonyjagodka/tonyai/src");
   const [editingRagDir, setEditingRagDir] = useState(false);
   const [workspaceDir, setWorkspaceDir] = useState(() => localStorage.getItem("tonyai-workspace-dir") || DEFAULT_WORKSPACE_DIR);
   const [editingWorkspaceDir, setEditingWorkspaceDir] = useState(false);
@@ -1907,6 +1884,13 @@ export default function App() {
 
   // Record uncaught errors / promise rejections to the on-disk diagnostic log.
   useEffect(() => { installGlobalErrorLogging(); }, []);
+
+  // Restore per-model chars-per-token ratios so compaction is calibrated from the
+  // first request of the session rather than relearning after each launch.
+  useEffect(() => {
+    try { loadTokenRatios(JSON.parse(localStorage.getItem("tonyai-token-ratios") || "{}")); }
+    catch { /* corrupt entry — fall back to the conservative default */ }
+  }, []);
 
   // Load the search API key from Rust-managed secret storage (~/.tonyai/secret-brave.txt,
   // mode 0600) — kept out of localStorage so untrusted page content can't scrape it.
@@ -2262,9 +2246,9 @@ export default function App() {
     return () => document.removeEventListener("keydown", onKey);
   }, []);
 
-  // Load RAG index when entering arb or auto mode
+  // Load RAG index when entering sui or auto mode
   useEffect(() => {
-    if ((mode === "arb" || mode === "auto") && ragIndex === null && ragStatus === "idle") {
+    if ((mode === "sui" || mode === "auto") && ragIndex === null && ragStatus === "idle") {
       loadRagIndex();
     }
   }, [mode]);
@@ -3004,12 +2988,12 @@ MEMORY: If you learn a user preference, project constraint, correction, or recur
       }
 
       // Arb bot RAG injection
-      if (effectiveMode === "arb" && ragIndex && ragStatus === "ready") {
+      if (effectiveMode === "sui" && ragIndex && ragStatus === "ready") {
         try {
           const qEmbed = await embedQuery(prompt);
           const chunks = hybridRetrieve(ragIndex.chunks, qEmbed, prompt, 4);
           if (chunks.length > 0) {
-            sys += `\n\n[CODEBASE CONTEXT — top ${chunks.length} chunks from arb bot source]\n${formatRagContext(chunks)}\n[END CODEBASE CONTEXT]`;
+            sys += `\n\n[CODEBASE CONTEXT — top ${chunks.length} chunks from the indexed source tree]\n${formatRagContext(chunks)}\n[END CODEBASE CONTEXT]`;
           }
         } catch (e) { console.warn("Arb RAG failed:", e.message); }
       }
@@ -3048,7 +3032,7 @@ MEMORY: If you learn a user preference, project constraint, correction, or recur
       // Level 2 (≥85%): LLM-summarize old messages into a dense context block.
       {
         const KEEP_RECENT = 8; // always keep the N most recent messages verbatim
-        const estTokens = estimateTokens(sys, ...ollamaHistory.map(m => m.content));
+        const estTokens = estimateTokens(activeModel, sys, ...ollamaHistory.map(m => m.content));
         const ctxLimit  = effectiveNumCtx;
 
         if (estTokens > ctxLimit * 0.70 && ollamaHistory.length > KEEP_RECENT + 2) {
@@ -3093,7 +3077,7 @@ MEMORY: If you learn a user preference, project constraint, correction, or recur
 
       // ── Agentic tool-calling loop — runs for every mode that has a non-empty tool set ──
       // chat + image stay single-shot (empty tool set). All other modes (code, python, sui,
-      // arb, agent, auto) get their scoped tool set and run the full ReAct loop.
+      // agent, auto) get their scoped tool set and run the full ReAct loop.
       const modeToolSet = getActiveToolsForMode(effectiveMode);
 
       if (modeToolSet.length > 0) {
@@ -3170,11 +3154,14 @@ After getting results, give your final answer in normal markdown. Never include 
             let streamText = "";
             let toolCalls = null;
             let rafId = null;
+            const sentChars = loopMsgs.reduce((n, m) => n + (m.content || "").length, 0);
 
             const unlisten = await listen(`ollama-chunk-${eventId}`, (event) => {
               for (const line of (event.payload || "").split("\n").filter(Boolean)) {
                 try {
                   const j = JSON.parse(line);
+                  // Final chunk reports the prompt's true token count — calibrate on it.
+                  if (j.prompt_eval_count) recordPromptTokens(activeModel, sentChars, j.prompt_eval_count);
                   if (j.message?.content) {
                     streamText += j.message.content;
                     if (rafId === null) {
@@ -3468,7 +3455,7 @@ After getting results, give your final answer in normal markdown. Never include 
                     toolResult = wrapUntrustedContent(fnArgs.url, await invoke("tool_fetch_url", { url: fnArgs.url }));
                     sawWebContent = true;
                   }
-                  else if (fnName === "read_file")    toolResult = await invoke("tool_read_file",    { path: fnArgs.path });
+                  else if (fnName === "read_file")    toolResult = await invoke("tool_read_file",    { path: fnArgs.path, offset: fnArgs.offset ?? null, limit: fnArgs.limit ?? null });
                   else if (fnName === "list_dir")     toolResult = await invoke("tool_list_dir",     { path: fnArgs.path });
                   else if (fnName === "search_files") toolResult = await invoke("tool_search_files", { dir: fnArgs.dir, pattern: fnArgs.pattern, extensions: fnArgs.extensions ?? null, maxResults: fnArgs.max_results ?? null });
                   else if (fnName === "run_command")  toolResult = await invoke("tool_run_command",  { command: fnArgs.command, timeoutSeconds: fnArgs.timeout_seconds ?? null });
@@ -3714,7 +3701,7 @@ After getting results, give your final answer in normal markdown. Never include 
             {
               const KEEP_AGENT = 6;
               const ctxLimit   = effectiveNumCtx;
-              const estToks    = estimateTokens(...ollamaMsgs.map(m => m.content || ""));
+              const estToks    = estimateTokens(activeModel, ...ollamaMsgs.map(m => m.content || ""));
 
               if (estToks > ctxLimit * 0.70 && ollamaMsgs.length > KEEP_AGENT + 2) {
                 const older  = ollamaMsgs.slice(1, ollamaMsgs.length - KEEP_AGENT);
@@ -3824,6 +3811,7 @@ After getting results, give your final answer in normal markdown. Never include 
       if (streamRef.current[sessId]) streamRef.current[sessId].eventId = eventId;
       let streamText = "";
       let rafId = null; // rAF handle — limits React re-renders to ~60fps
+      const sentChars = reqBody.messages.reduce((n, m) => n + (m.content || "").length, 0);
       setMessages(prev=>[...prev,{ role:"assistant", content:"", ...(mode==="auto" ? { routedMode: effectiveMode } : {}) }]);
 
       // Listen for streaming chunks emitted by the Rust ollama_chat command.
@@ -3833,6 +3821,8 @@ After getting results, give your final answer in normal markdown. Never include 
         for (const line of (event.payload || "").split("\n").filter(Boolean)) {
           try {
             const j = JSON.parse(line);
+            // Final chunk reports the prompt's true token count — calibrate on it.
+            if (j.prompt_eval_count) recordPromptTokens(activeModel, sentChars, j.prompt_eval_count);
             if (j.message?.content) {
               streamText += j.message.content;
               if (rafId === null) {
@@ -4499,7 +4489,7 @@ After getting results, give your final answer in normal markdown. Never include 
         )}
 
         {/* devInspect panel */}
-        {showDevInspect&&(mode==="arb"||mode==="sui")&&(
+        {showDevInspect&&mode==="sui"&&(
           <DevInspectPanel accent={accent} onClose={()=>setShowDevInspect(false)}/>
         )}
 
@@ -4576,7 +4566,7 @@ After getting results, give your final answer in normal markdown. Never include 
               {/* Text area */}
               <textarea value={tabText} onChange={e=>saveTabText(e.target.value)}
                 placeholder={isGlobal
-                  ? "Facts Tony always knows:\n- My Sui wallet: 0x43a5…\n- Arb bot: pm2 as 'sui-arb-bot'\n- Prefer concise answers"
+                  ? "Facts Tony always knows:\n- My Sui wallet: 0x43a5…\n- Prefer concise answers"
                   : `Notes for ${curMode?.label||mode} mode only…`}
                 style={{ width:"100%", height:90, background:"var(--tny-bg)", border:`1px solid ${tabText?"var(--tny-line3)":"var(--tny-line2)"}`, color:"var(--tny-tx3)", borderRadius:8, padding:"8px 10px", fontSize:12, fontFamily:"'JetBrains Mono',monospace", outline:"none", resize:"vertical", lineHeight:1.6 }}/>
 
@@ -4622,10 +4612,10 @@ After getting results, give your final answer in normal markdown. Never include 
             <textarea
               value={context}
               onChange={e=>setContext(e.target.value)}
-              placeholder={mode==="arb"?"Paste src/flash-executor.ts, src/pairs.ts, or any bot file here…":mode==="sui"?"Paste your Move module source here…":"Paste any file content to give the model context…"}
+              placeholder={mode==="sui"?"Paste your Move module source here…":"Paste any file content to give the model context…"}
               style={{ width:"100%", height:90, background:"var(--tny-bg)", border:`1px solid ${context?"var(--tny-line3)":"var(--tny-line2)"}`, color:"var(--tny-tx3)", borderRadius:8, padding:"8px 10px", fontSize:12, fontFamily:"'JetBrains Mono',monospace", outline:"none", resize:"vertical", lineHeight:1.5 }}
             />
-            {context&&<div style={{ fontSize:10, color:"var(--tny-tx5)", marginTop:3 }}>{context.length.toLocaleString()} chars · ~{Math.ceil(context.length/4).toLocaleString()} tokens</div>}
+            {context&&<div style={{ fontSize:10, color:"var(--tny-tx5)", marginTop:3 }}>{context.length.toLocaleString()} chars · ~{estimateTokens(activeModel, context).toLocaleString()} tokens</div>}
           </div>
         )}
 

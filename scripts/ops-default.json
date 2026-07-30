@@ -1,5 +1,5 @@
 {
-  "comment": "TonyAI portfolio ops checks. This file seeds ~/.tonyai/ops.json on first run — edit THAT copy (read every run). Delete ~/.tonyai/ops.json to re-seed from here. Fields: intervalMin (check cadence), severity (critical=notification, warning/info=inbox only), expect for pm2 (online | not-errored | report).",
+  "comment": "TonyAI portfolio ops checks. This file seeds ~/.tonyai/ops.json on first run \u2014 edit THAT copy (read every run). Delete ~/.tonyai/ops.json to re-seed from here. Fields: intervalMin (check cadence), severity (critical=notification, warning/info=inbox only), expect for pm2 (online | not-errored | report).",
   "checks": [
     {
       "id": "por-attestor",
@@ -55,7 +55,7 @@
       "maxPerInterval": 40,
       "intervalMin": 15,
       "severity": "warning",
-      "anomalyNote": "Unusual spike in L0 mints — possible gas-drain / sybil burst. Check attestor logs + gas.",
+      "anomalyNote": "Unusual spike in L0 mints \u2014 possible gas-drain / sybil burst. Check attestor logs + gas.",
       "note": "daily L0 mint counter off /api/health"
     },
     {
@@ -68,7 +68,7 @@
       "maxPerInterval": 25,
       "intervalMin": 15,
       "severity": "warning",
-      "anomalyNote": "Unusual spike in L2 real-action grants — possible farming / compromised source.",
+      "anomalyNote": "Unusual spike in L2 real-action grants \u2014 possible farming / compromised source.",
       "note": "daily L2 accrual counter off /api/health (live after the attestor redeploys)"
     },
     {
@@ -79,56 +79,6 @@
       "url": "https://gulp-city.netlify.app",
       "intervalMin": 30,
       "severity": "warning"
-    },
-    {
-      "id": "fairline-core",
-      "project": "FairLine",
-      "label": "watcher + dashboard",
-      "type": "pm2",
-      "processes": [
-        "fairline-watcher",
-        "fairline-dashboard"
-      ],
-      "expect": "online",
-      "intervalMin": 5,
-      "severity": "warning"
-    },
-    {
-      "id": "fairline-crons",
-      "project": "FairLine",
-      "label": "cron processes",
-      "type": "pm2",
-      "processes": [
-        "fairline-snapshot",
-        "fairline-mark",
-        "fairline-summary",
-        "fairline-flywheel",
-        "fairline-vault-engine",
-        "fairline-mm"
-      ],
-      "expect": "not-errored",
-      "intervalMin": 30,
-      "severity": "warning"
-    },
-    {
-      "id": "fairline-dash-http",
-      "project": "FairLine",
-      "label": "dashboard :3002",
-      "type": "http",
-      "url": "http://127.0.0.1:3002",
-      "intervalMin": 30,
-      "severity": "warning"
-    },
-    {
-      "id": "arb-bot",
-      "project": "Bots",
-      "label": "sui-arb-bot",
-      "type": "pm2",
-      "processes": [
-        "sui-arb-bot"
-      ],
-      "expect": "report",
-      "intervalMin": 30
     },
     {
       "id": "por-mainnet-minted",
@@ -152,7 +102,7 @@
       "minBalanceSui": 0.05,
       "intervalMin": 360,
       "severity": "warning",
-      "note": "attestor mainnet float — top up before pilot mints"
+      "note": "attestor mainnet float \u2014 top up before pilot mints"
     },
     {
       "id": "jamie-gumroad",
@@ -162,7 +112,7 @@
       "url": "https://uigstudios.gumroad.com/l/jamie",
       "intervalMin": 60,
       "severity": "warning",
-      "note": "the store shelf — first revenue product"
+      "note": "the store shelf \u2014 first revenue product"
     },
     {
       "id": "fairline-operator-gas",
@@ -174,50 +124,7 @@
       "minBalanceSui": 0.5,
       "intervalMin": 60,
       "severity": "warning",
-      "note": "gases the whole FairLine cron fleet (MM burns ~0.3-0.5/day) + Acre/PoR deploys — top up at faucet reset"
-    },
-    {
-      "id": "acre-keeper-gas",
-      "project": "Acre",
-      "label": "keeper/attestor gas",
-      "type": "sui-balance",
-      "rpc": "https://fullnode.testnet.sui.io:443",
-      "address": "0xfae1878fb0aa68c5c78ef10b3604036153e323f7e28e4015016e1f27f60a5109",
-      "minBalanceSui": 0.15,
-      "intervalMin": 60,
-      "severity": "warning",
-      "note": "pays 6h tax settles + sponsors walk check-ins; dry keeper = empty pot + dead check-ins"
-    },
-    {
-      "id": "acre-indexer",
-      "project": "Acre",
-      "label": "indexer (Render)",
-      "type": "http",
-      "url": "https://acre-indexer.onrender.com/health",
-      "intervalMin": 5,
-      "timeoutMs": 55000,
-      "severity": "critical",
-      "note": "5-min ping doubles as Render free-tier keep-alive (fixes the mobile 15s black screen)"
-    },
-    {
-      "id": "acre-attestor",
-      "project": "Acre",
-      "label": "attestor (Render)",
-      "type": "http",
-      "url": "https://acre-attestor.onrender.com/health",
-      "intervalMin": 5,
-      "timeoutMs": 55000,
-      "severity": "critical",
-      "note": "5-min ping doubles as keep-alive; dead attestor = no check-ins"
-    },
-    {
-      "id": "acre-site",
-      "project": "Acre",
-      "label": "game site",
-      "type": "http",
-      "url": "https://acre-game.netlify.app",
-      "intervalMin": 30,
-      "severity": "warning"
+      "note": "gases the whole FairLine cron fleet (MM burns ~0.3-0.5/day) + Acre/PoR deploys \u2014 top up at faucet reset"
     }
   ]
 }

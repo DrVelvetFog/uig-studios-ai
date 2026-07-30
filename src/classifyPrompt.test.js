@@ -39,21 +39,23 @@ describe("image — weak signals suppressed by programming context", () => {
     expect(classifyPrompt("build a component with a photo upload feature in React")).toBe("code"));
 });
 
-// ── Arb bot ───────────────────────────────────────────────────────────────────
-describe("arb bot", () => {
-  it("flash loan", () => expect(classifyPrompt("Why is my flash loan failing?")).toBe("arb"));
-  it("flash-loan hyphen", () => expect(classifyPrompt("Optimize the flash-loan PTB latency")).toBe("arb"));
-  it("arb bot", () => expect(classifyPrompt("restart the arb bot after a circuit breaker")).toBe("arb"));
-  it("pairs.ts", () => expect(classifyPrompt("Add a new pair to pairs.ts")).toBe("arb"));
-  it("monitor.ts", () => expect(classifyPrompt("Debug the polling loop in monitor.ts")).toBe("arb"));
-  it("Turbos swap", () => expect(classifyPrompt("Why does the Turbos swap return wrong output?")).toBe("arb"));
-  it("Bluefin pool", () => expect(classifyPrompt("Check the Bluefin pool liquidity")).toBe("arb"));
-  it("Cetus route", () => expect(classifyPrompt("Add Cetus to the route for DEEP/SUI")).toBe("arb"));
-  it("NAVI_PKG", () => expect(classifyPrompt("NAVI_PKG address changed on mainnet")).toBe("arb"));
-  it("flash_loan_with_ctx", () => expect(classifyPrompt("flash_loan_with_ctx_v2 keeps reverting")).toBe("arb"));
-  it("pm2 restart", () => expect(classifyPrompt("pm2 restart sui-arb-bot")).toBe("arb"));
-  it("circuit breaker", () => expect(classifyPrompt("circuit breaker triggered 3 times today")).toBe("arb"));
-  it("daily loss cap", () => expect(classifyPrompt("How does the daily loss cap reset?")).toBe("arb"));
+// ── Sui DeFi / DEX ────────────────────────────────────────────────────────────
+// These used to route to a dedicated "arb" mode built around one now-dead bot.
+// The protocol knowledge outlived it, so they land in sui mode.
+describe("sui defi / dex", () => {
+  it("flash loan", () => expect(classifyPrompt("Why is my flash loan failing?")).toBe("sui"));
+  it("flash-loan hyphen", () => expect(classifyPrompt("Optimize the flash-loan PTB latency")).toBe("sui"));
+  it("Turbos swap", () => expect(classifyPrompt("Why does the Turbos swap return wrong output?")).toBe("sui"));
+  it("Bluefin pool", () => expect(classifyPrompt("Check the Bluefin pool liquidity")).toBe("sui"));
+  it("Cetus route", () => expect(classifyPrompt("Add Cetus to the route for DEEP/SUI")).toBe("sui"));
+  it("DeepBook pool", () => expect(classifyPrompt("Check the DeepBook pool liquidity")).toBe("sui"));
+  it("NAVI_PKG", () => expect(classifyPrompt("NAVI_PKG address changed on mainnet")).toBe("sui"));
+  it("flash_loan_with_ctx", () => expect(classifyPrompt("flash_loan_with_ctx_v2 keeps reverting")).toBe("sui"));
+
+  // Bot-operations phrasing is no longer a Sui-development signal. These fall
+  // through to whatever the rest of the prompt warrants, which is the point.
+  it("pm2 restart no longer implies Sui work", () => expect(classifyPrompt("pm2 restart sui-arb-bot")).not.toBe("sui"));
+  it("circuit breaker no longer implies Sui work", () => expect(classifyPrompt("circuit breaker triggered 3 times today")).not.toBe("sui"));
 });
 
 // ── Sui / Move ────────────────────────────────────────────────────────────────
@@ -121,8 +123,8 @@ describe("chat (default)", () => {
 
 // ── Edge cases ────────────────────────────────────────────────────────────────
 describe("edge cases", () => {
-  it("arb fires before sui even when Move keyword present", () =>
-    expect(classifyPrompt("debug the flash loan Move call in flash-executor.ts")).toBe("arb"));
+  it("DeFi and Move phrasing both land in sui — they are one mode now", () =>
+    expect(classifyPrompt("debug the flash loan Move call in flash-executor.ts")).toBe("sui"));
 
   it("sui fires before python for Move+Python mix", () =>
     expect(classifyPrompt("call a Sui object method from Python")).toBe("sui"));

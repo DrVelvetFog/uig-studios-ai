@@ -12,7 +12,7 @@
  *
  * Check types:
  *   http             — GET url, up on 2xx. metric = latency ms.
- *   sui-balance      — suix_getBalance; down when below minBalanceSui. metric = SUI.
+ *   sui-balance      — SUI balance over GraphQL; down when below minBalanceSui. metric = SUI.
  *   sui-object-field — read a u64 field off a shared object; info finding when it
  *                      INCREASES (growth signal, e.g. PoR total_minted). metric = value.
  *   http-field       — read a numeric dot-path field from a JSON HTTP response (e.g.
@@ -62,28 +62,52 @@ async function httpCheck(c) {
   }
 }
 
-async function suiRpc(url, method, params) {
-  const res = await fetch(url, {
+// Mysten retired JSON-RPC on the public fullnodes (mainnet week of 2026-07-20; the
+// testnet nodes answer the same "Method not found … migrate to gRPC or GraphQL").
+// GraphQL is the dependency-free replacement — plain POST over fetch, so this script
+// stays stdlib-only (gRPC would drag @mysten/sui into an app with no runtime JS deps).
+// The endpoint is derived from the network named in the existing `rpc` URL, so old
+// configs keep working untouched; override per check with `graphql`.
+const SUI_GRAPHQL = {
+  mainnet: "https://graphql.mainnet.sui.io/graphql",
+  testnet: "https://graphql.testnet.sui.io/graphql",
+  devnet:  "https://graphql.devnet.sui.io/graphql",
+};
+
+function suiGraphqlUrl(c) {
+  if (c.graphql) return c.graphql;
+  const net = Object.keys(SUI_GRAPHQL).find((n) => String(c.rpc || "").includes(n));
+  if (!net) throw new Error(`no GraphQL endpoint for rpc "${c.rpc}" — set "graphql" on the check`);
+  return SUI_GRAPHQL[net];
+}
+
+async function suiGraphql(c, query) {
+  const res = await fetch(suiGraphqlUrl(c), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     signal: AbortSignal.timeout(15000),
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    body: JSON.stringify({ query }),
   });
   const data = await res.json();
-  if (data.error) throw new Error(data.error.message);
-  return data.result;
+  if (data.errors?.length) throw new Error(data.errors[0].message);
+  if (!data.data) throw new Error(`HTTP ${res.status}: empty GraphQL response`);
+  return data.data;
 }
 
 async function suiBalanceCheck(c) {
   try {
-    const r   = await suiRpc(c.rpc, "suix_getBalance", [c.address]);
-    const sui = Number(r.totalBalance) / 1e9;
+    const coin = c.coinType || "0x2::sui::SUI";
+    const d = await suiGraphql(c, `{ address(address: "${c.address}") {
+      balance(coinType: "${coin}") { totalBalance } } }`);
+    // An address the node has never seen returns null rather than an error — that is a
+    // genuine zero balance (and, for a gas wallet, exactly the alert we want to fire).
+    const sui = Number(d.address?.balance?.totalBalance ?? 0) / 1e9;
     const min = c.minBalanceSui ?? 0.2;
     return sui < min
       ? { status: "down", detail: `${sui.toFixed(3)} SUI — below min ${min}`, metric: sui }
       : { status: "up",   detail: `${sui.toFixed(3)} SUI`, metric: sui };
   } catch (e) {
-    return { status: "unknown", detail: `RPC: ${e.message}` };
+    return { status: "unknown", detail: `GraphQL: ${e.message}` };
   }
 }
 
@@ -107,12 +131,15 @@ async function httpFieldCheck(c) {
 
 async function suiObjectFieldCheck(c) {
   try {
-    const r = await suiRpc(c.rpc, "sui_getObject", [c.objectId, { showContent: true }]);
-    const v = Number(r.data?.content?.fields?.[c.field]);
+    // `contents { json }` is the GraphQL equivalent of showContent's fields map —
+    // u64s still arrive as strings, so Number() does the same job it always did.
+    const d = await suiGraphql(c, `{ object(address: "${c.objectId}") {
+      asMoveObject { contents { json } } } }`);
+    const v = Number(d.object?.asMoveObject?.contents?.json?.[c.field]);
     if (Number.isNaN(v)) return { status: "unknown", detail: `field ${c.field} not found` };
     return { status: "up", detail: `${c.field} = ${v}`, metric: v };
   } catch (e) {
-    return { status: "unknown", detail: `RPC: ${e.message}` };
+    return { status: "unknown", detail: `GraphQL: ${e.message}` };
   }
 }
 
@@ -311,7 +338,7 @@ function capHistory() {
 
 // ── Daily ops brief ───────────────────────────────────────────────────────────
 // One info finding per day, first monitor run at/after BRIEF_HOUR local time.
-// Digest of ops state + last-24h alerts + disk + arb-db freshness, summarized
+// Digest of ops state + last-24h alerts + disk, summarized
 // by the local model (llmAnalyze); falls back to the raw digest if Ollama is
 // unavailable, so the brief always lands.
 
@@ -361,17 +388,8 @@ export async function runDailyBrief({ addFinding, llmAnalyze, run }) {
   const pct = df.match(/(\d+)%/)?.[1];
   if (pct) lines.push("", `DISK: ${pct}% used`);
 
-  const arbDb = join(HOME, "sui-arb-ai", "data", "arb-bot.db");
-  if (existsSync(arbDb)) {
-    try {
-      const out = run(`/usr/bin/sqlite3 "${arbDb}" "SELECT COUNT(*), MAX(timestamp) FROM opportunities"`, 10000).trim();
-      const [count, maxTs] = out.split("|").map(Number);
-      if (count > 0 && maxTs) {
-        const ageH = Math.round((Date.now() - (maxTs > 1e12 ? maxTs : maxTs * 1000)) / 3600000);
-        lines.push(`ARB BOT DB: ${count} opportunities recorded, last activity ${ageH}h ago${ageH > 24 ? " (bot idle)" : ""}`);
-      }
-    } catch {}
-  }
+  // (An arb-bot telemetry section used to live here. The bot is retired — its db is
+  // frozen, so the line only ever reported a growing "idle" age. Removed 2026-07-30.)
 
   const digest = lines.join("\n");
   const summary = await llmAnalyze(BRIEF_SYSTEM, digest);

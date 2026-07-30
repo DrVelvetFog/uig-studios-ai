@@ -113,103 +113,10 @@ async function llmAnalyze(systemPrompt, userContent, model = "hermes3") {
   }
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// JOB 1 — Arb bot health
-// ══════════════════════════════════════════════════════════════════════════════
-
-async function checkArbBot() {
-  const status = run("pm2 describe sui-arb-bot --no-color");
-  const logs   = run("pm2 logs sui-arb-bot --lines 100 --nostream --no-color");
-
-  // ── Status flags ────────────────────────────────────────────────────────────
-  const isStopped     = /│\s*status\s*│\s*stopped/i.test(status);
-  const isErrored     = /│\s*status\s*│\s*errored/i.test(status);
-  const restartsMatch = status.match(/│\s*restarts\s*│\s*(\d+)/i);
-  const restarts      = restartsMatch ? parseInt(restartsMatch[1]) : 0;
-
-  // ── Log flags ───────────────────────────────────────────────────────────────
-  const has403        = /403|Forbidden/i.test(logs);
-  const hasCircuit    = /circuit breaker/i.test(logs);
-  const hasFatal      = /FATAL|uncaughtException|Cannot read prop|UnhandledPromise/i.test(logs);
-  const hasTimeout    = /timed? ?out|ETIMEDOUT|ECONNREFUSED/i.test(logs);
-
-  // ── Critical: bot stopped ───────────────────────────────────────────────────
-  if (isStopped || isErrored) {
-    const reason = has403    ? "HTTP 403 on RPC — endpoint blocked/rate-limited."
-                 : hasFatal  ? "Fatal uncaught exception — check error logs."
-                 : hasTimeout? "Connection timeout — RPC or DEX unreachable."
-                 : "Unknown — check pm2 logs.";
-    const isNew = addFinding({
-      source:   "arb-bot-stopped",
-      severity: "critical",
-      title:    `sui-arb-bot is ${isErrored ? "errored" : "stopped"}`,
-      body:     reason,
-      context:  logs.slice(-3000),
-    });
-    if (isNew) notify("⚡ Arb Bot Down", reason);
-    return; // no point running deeper checks if stopped
-  }
-
-  // ── Warning: high restarts ──────────────────────────────────────────────────
-  if (restarts > 10) {
-    const isNew = addFinding({
-      source:   "arb-bot-restarts",
-      severity: "warning",
-      title:    `sui-arb-bot: ${restarts} total restarts`,
-      body:     "High restart count — bot may be crash-looping. Check error log.",
-      context:  logs.slice(-2000),
-    }, 120); // only re-notify every 2h
-    if (isNew) notify("⚡ Arb Bot Unstable", `${restarts} restarts`);
-  }
-
-  // ── Warning: circuit breaker ────────────────────────────────────────────────
-  if (hasCircuit) {
-    addFinding({
-      source:   "arb-bot-circuit",
-      severity: "warning",
-      title:    "Circuit breaker triggered",
-      body:     "3+ consecutive trade failures. Bot paused for 15 min. Check spreads and RPC.",
-      context:  logs.slice(-1500),
-    });
-  }
-
-  // ── Warning: 403 while running ──────────────────────────────────────────────
-  if (has403) {
-    addFinding({
-      source:   "arb-bot-403",
-      severity: "warning",
-      title:    "HTTP 403 on RPC endpoint",
-      body:     "Chainstack or RPC provider is returning 403. Check API key / quota.",
-      context:  logs.slice(-1500),
-    });
-  }
-
-  // ── LLM analysis: deeper pattern detection ──────────────────────────────────
-  // Only run if Ollama is reachable (skip silently if not)
-  const recentLogs = logs.split("\n").slice(-60).join("\n");
-  const analysis = await llmAnalyze(
-    `You monitor a Sui DeFi arbitrage bot. Analyze the log lines below.
-Reply with ONE of:
-  OK                         — if everything looks normal
-  FINDING: <one line>        — if you spot something worth flagging
-
-Flag: recurring errors, abnormal spread patterns, missed opportunities, degraded performance, RPC issues.
-Do NOT flag: normal polling output, prices showing, negative spreads (those are expected and normal).
-Be extremely conservative — only flag genuinely unusual things.`,
-    recentLogs
-  );
-
-  if (analysis.startsWith("FINDING:")) {
-    const summary = analysis.replace("FINDING:", "").trim();
-    addFinding({
-      source:   "arb-bot-insight",
-      severity: "info",
-      title:    summary.slice(0, 80),
-      body:     summary,
-      context:  recentLogs,
-    }, 30); // dedup 30 min for LLM insights
-  }
-}
+// (JOB 1 — Arb bot health — REMOVED 2026-07-30. The sui-arb-bot is retired and was
+// never in pm2, so every 5-minute run shelled out to `pm2 describe`/`pm2 logs` for a
+// process that does not exist. That is what filled ~/.tonyai/monitor-error.log with
+// [PM2][WARN] lines, and each run also spent an Ollama call analyzing empty logs.)
 
 // ══════════════════════════════════════════════════════════════════════════════
 // JOB 2 — Ollama model staleness
@@ -257,7 +164,7 @@ async function checkDiskSpace() {
       source:   "disk-critical",
       severity: "critical",
       title:    `Disk at ${pct}% — critical`,
-      body:     "Nearly full. Ollama model pulls and arb bot logs may fail.",
+      body:     "Nearly full. Ollama model pulls and log writes may fail.",
       context:  output,
     }, 60);
     if (isNew) notify("💾 Disk Space Critical", `${pct}% used`);
@@ -281,7 +188,6 @@ async function main() {
   console.log(`[tonyai-monitor] ${ts} — running checks`);
 
   const results = await Promise.allSettled([
-    checkArbBot(),
     checkOllamaModels(),
     checkDiskSpace(),
     runOpsChecks({ addFinding, notify, run }),
@@ -289,7 +195,7 @@ async function main() {
   ]);
 
   results.forEach((r, i) => {
-    const names = ["arb-bot", "ollama-models", "disk-space", "ops", "daily-brief"];
+    const names = ["ollama-models", "disk-space", "ops", "daily-brief"];
     if (r.status === "rejected") {
       console.error(`[tonyai-monitor] ${names[i]} check failed:`, r.reason?.message || r.reason);
     }

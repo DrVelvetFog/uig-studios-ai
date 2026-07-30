@@ -221,6 +221,18 @@ describe("neededSearchButSkipped", () => {
   it("passes for prompts that don't need current info", () => {
     expect(neededSearchButSkipped("Explain how a hashmap works", [])).toBe(false);
   });
+  it("does not count a search that was rate-limited into a challenge page", () => {
+    const blocked = [{ name: "web_search", result: "SEARCH DID NOT RUN — DuckDuckGo rate-limited this request with a bot challenge." }];
+    expect(neededSearchButSkipped("latest SUI price?", blocked)).toBe(true);
+  });
+  it("does not count a search whose results were unparseable", () => {
+    const empty = [{ name: "web_search", result: "DuckDuckGo returned a page with no parseable results for 'x'. … treat the web as UNCHECKED rather than empty." }];
+    expect(neededSearchButSkipped("recent news", empty)).toBe(true);
+  });
+  it("still counts a search that actually returned results", () => {
+    const ok = [{ name: "web_search", result: "[1] Sui price today\n    URL: example.com\n    SUI is trading at…" }];
+    expect(neededSearchButSkipped("latest SUI price?", ok)).toBe(false);
+  });
 });
 
 describe("evaluateStopCondition", () => {
