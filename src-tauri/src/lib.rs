@@ -823,6 +823,31 @@ fn finalize_tool_calls(tool_calls: &StdHashMap<u64, ToolCallAccum>) -> Option<St
 }
 
 #[cfg(test)]
+mod mcp_secret_key_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_ids_pass_through() {
+        assert_eq!(mcp_secret_key("github"), "mcp-github");
+        assert_eq!(mcp_secret_key("my-server_2"), "mcp-my-server_2");
+    }
+
+    #[test]
+    fn path_traversal_cannot_escape_the_secrets_dir() {
+        // Server ids come from the user; a raw id here would write outside ~/.tonyai.
+        assert_eq!(mcp_secret_key("../../etc/passwd"), "mcp-______etc_passwd");
+        assert!(secret_key_ok(&mcp_secret_key("../../etc/passwd")));
+    }
+
+    #[test]
+    fn every_produced_key_is_accepted_by_the_secret_store() {
+        for id in ["a b", "sürüm", "x/y\\z", "", "🙂", "tab\there"] {
+            assert!(secret_key_ok(&mcp_secret_key(id)), "rejected key for id {id:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod cloud_sse_tests {
     use super::*;
 
@@ -2825,6 +2850,20 @@ async fn mcp_http_notify(
 /// Start an MCP server (stdio subprocess or streamable-HTTP endpoint), complete
 /// the initialize handshake, discover ALL its tools (cursor pagination), and
 /// register it. Returns the tools list as JSON.
+/// Secret-store key holding an MCP server's bearer token.
+///
+/// The token is deliberately NOT accepted as a command argument: taking it from the
+/// webview would mean it lives in JS memory and (as it previously did) in localStorage,
+/// where any untrusted page content rendered in the agent could scrape it. Server ids
+/// are user-supplied, so non-key charset is folded to '_' to keep secret_key_ok happy
+/// and block path traversal.
+fn mcp_secret_key(id: &str) -> String {
+    let sanitized: String = id.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    format!("mcp-{}", sanitized)
+}
+
 #[tauri::command]
 async fn mcp_initialize(
     state:      tauri::State<'_, McpManager>,
@@ -2834,7 +2873,6 @@ async fn mcp_initialize(
     env_vars:   Option<StdHashMap<String, String>>,
     transport:  Option<String>,
     url:        Option<String>,
-    auth_token: Option<String>,
 ) -> Result<String, String> {
     let init_params = serde_json::json!({
         "protocolVersion": "2025-03-26",
@@ -2846,7 +2884,10 @@ async fn mcp_initialize(
     if transport.as_deref() == Some("http") {
         let url = url.filter(|u| !u.trim().is_empty())
             .ok_or("HTTP transport requires a server URL")?;
-        let auth = auth_token.filter(|t| !t.trim().is_empty());
+        // Read straight from the 0600 secret store — never from the caller.
+        let auth = read_secret_value(&mcp_secret_key(&id)).ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
         let session: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
         let next_id = Arc::new(AtomicU64::new(1));
 

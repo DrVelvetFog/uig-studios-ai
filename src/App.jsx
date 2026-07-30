@@ -1287,7 +1287,7 @@ async function runSubagent({ role, task, model, signal, braveApiKey, onProgress,
                 checkpoint.mutatedPaths.add(fnArgs.path);
               } catch {}
             }
-            if      (fnName === "web_search")   toolResult = await invoke("tool_web_search",   { query: fnArgs.query,   braveApiKey: braveApiKey||"" });
+            if      (fnName === "web_search")   toolResult = wrapUntrustedContent(`web_search: ${fnArgs.query}`, await invoke("tool_web_search", { query: fnArgs.query, braveApiKey: braveApiKey||"" }));
             else if (fnName === "fetch_url")    toolResult = wrapUntrustedContent(fnArgs.url, await invoke("tool_fetch_url", { url: fnArgs.url }));
             else if (fnName === "read_file")    toolResult = await invoke("tool_read_file",    { path: fnArgs.path, offset: fnArgs.offset ?? null, limit: fnArgs.limit ?? null });
             else if (fnName === "list_dir")     toolResult = await invoke("tool_list_dir",     { path: fnArgs.path });
@@ -1850,6 +1850,9 @@ export default function App() {
   const [homeDir, setHomeDir] = useState("/Users/tonyjagodka"); // populated from Rust at bootstrap
   const [ramBytes, setRamBytes] = useState(0); // total RAM — for model-fit estimation
   // MCP server configurations (persisted to localStorage)
+  // Guards the mcpServers persist effect until legacy plaintext tokens are safely in
+  // the 0600 secret store — see the migration effect below.
+  const [mcpTokensMigrated, setMcpTokensMigrated] = useState(false);
   const [mcpServers, setMcpServers] = useState(() => {
     try { return JSON.parse(localStorage.getItem("tonyai-mcp-servers") || "[]"); } catch { return []; }
   });
@@ -1964,7 +1967,43 @@ export default function App() {
   useEffect(() => { localStorage.setItem("tonyai-rag-dir", ragSourceDir); }, [ragSourceDir]);
   useEffect(() => { localStorage.setItem("tonyai-knowledge-dir", knowledgeDir); }, [knowledgeDir]);
   useEffect(() => { localStorage.setItem("tonyai-workspace-dir", workspaceDir); }, [workspaceDir]);
-  useEffect(() => { localStorage.setItem("tonyai-mcp-servers", JSON.stringify(mcpServers)); }, [mcpServers]);
+  // MCP bearer tokens NEVER reach localStorage — they live in ~/.tonyai/secret-mcp-<id>.txt
+  // (mode 0600), same as every other API key. Untrusted page content rendered in the agent
+  // can read localStorage; it cannot read that file. `authToken` is stripped on the way out
+  // and `hasToken` is persisted in its place purely so the UI can say "a token is saved".
+  //
+  // Gated on mcpTokensMigrated: writing the stripped list before the legacy tokens have
+  // been copied into the secret store would erase them from the only place they exist.
+  // If migration fails, this never runs, localStorage keeps the old value, and the next
+  // launch retries — stale beats destroyed.
+  useEffect(() => {
+    if (!mcpTokensMigrated) return;
+    const safe = mcpServers.map(({ authToken, ...rest }) => rest);
+    localStorage.setItem("tonyai-mcp-servers", JSON.stringify(safe));
+  }, [mcpServers, mcpTokensMigrated]);
+
+  // One-time migration of tokens saved before the secret store existed. Reads the
+  // mount-time state, which the useState initializer loaded from localStorage.
+  useEffect(() => {
+    (async () => {
+      const withTokens = mcpServers.filter(s => s && typeof s.authToken === "string" && s.authToken.trim());
+      if (withTokens.length === 0) { setMcpTokensMigrated(true); return; }
+      for (const s of withTokens) {
+        try {
+          await invoke("save_secret", { key: mcpSecretKey(s.id), value: s.authToken.trim() });
+        } catch (e) {
+          // Leave localStorage alone and stay un-migrated so we try again next launch.
+          logError("mcp token migration", e);
+          return;
+        }
+      }
+      const migratedIds = new Set(withTokens.map(s => s.id));
+      setMcpServers(prev => prev.map(s =>
+        migratedIds.has(s.id) ? { ...s, authToken: "", hasToken: true } : s
+      ));
+      setMcpTokensMigrated(true);
+    })();
+  }, []);
   useEffect(() => {
     if (!compactNotice) return;
     const t = setTimeout(() => setCompactNotice(""), 6000);
@@ -2039,6 +2078,12 @@ export default function App() {
   // ── MCP helpers ──────────────────────────────────────────────────────────
 
   // Convert an MCP tool definition → OpenAI-format tool (namespaced with server id)
+  // Must mirror mcp_secret_key() in lib.rs exactly — the two sides have to agree on
+  // which file a given server's token lives in.
+  function mcpSecretKey(id) {
+    return "mcp-" + String(id).replace(/[^A-Za-z0-9_-]/g, "_");
+  }
+
   function mcpToolToAgent(serverId, mcpTool) {
     return {
       type: "function",
@@ -2062,7 +2107,7 @@ export default function App() {
         id:        srv.id,
         transport: srv.transport === "http" ? "http" : "stdio",
         url:       srv.url || null,
-        authToken: srv.authToken || null,
+        // No authToken here on purpose — Rust reads it from the 0600 secret store.
         command:   srv.command || null,
         args:      argsArray,
         envVars:   Object.keys(envObj).length > 0 ? envObj : null,
@@ -3393,7 +3438,13 @@ After getting results, give your final answer in normal markdown. Never include 
                 }
                 else try {
                   if (fnName === "web_search") {
-                    toolResult = await invoke("tool_web_search", { query: fnArgs.query, braveApiKey: braveApiKey || "" });
+                    // Result titles and snippets are authored by whoever ranks for the
+                    // query — same trust level as a fetched page, so same treatment.
+                    toolResult = wrapUntrustedContent(
+                      `web_search: ${fnArgs.query}`,
+                      await invoke("tool_web_search", { query: fnArgs.query, braveApiKey: braveApiKey || "" }),
+                    );
+                    sawWebContent = true;
                   }
                   else if (fnName === "deep_search") {
                     // ── Smart deep_search: rank → dedupe → parallel fetch → filter junk ──
@@ -3493,11 +3544,16 @@ After getting results, give your final answer in normal markdown. Never include 
                     const argsVal    = typeof fnArgs === "string"
                       ? (() => { try { return JSON.parse(fnArgs); } catch { return {}; } })()
                       : (fnArgs || {});
-                    toolResult = await invoke("mcp_call_tool", {
-                      serverId,
-                      toolName,
-                      arguments: argsVal,
-                    });
+                    // An MCP result is remote data the model is about to read — a GitHub
+                    // issue body, a page of Netlify output — and anyone can put text in
+                    // those. Treat it exactly like fetched web content: wrap it so the
+                    // model knows it is data, and set the provenance flag so any later
+                    // mutating tool needs a human, allowlist or not.
+                    toolResult = wrapUntrustedContent(
+                      `MCP ${serverId}/${toolName}`,
+                      await invoke("mcp_call_tool", { serverId, toolName, arguments: argsVal }),
+                    );
+                    sawWebContent = true;
                   }
                   else if (fnName === "spawn_subagent") {
                     const subRole = fnArgs.role || "researcher";
@@ -4468,7 +4524,19 @@ After getting results, give your final answer in normal markdown. Never include 
                     <>
                       <input value={srv.url||""} placeholder="https://server.example.com/mcp" onChange={e=>setMcpServers(p=>p.map((s,i)=>i===idx?{...s,url:e.target.value}:s))}
                         style={{ flex:1, background:"var(--tny-code)", border:"1px solid var(--tny-line)", color:"var(--tny-tx3)", borderRadius:5, padding:"4px 7px", fontSize:11, fontFamily:"'JetBrains Mono',monospace", outline:"none" }}/>
-                      <input type="password" value={srv.authToken||""} placeholder="bearer token (optional)" onChange={e=>setMcpServers(p=>p.map((s,i)=>i===idx?{...s,authToken:e.target.value}:s))}
+                      <input type="password" value={srv.authToken||""}
+                        placeholder={srv.hasToken ? "token saved (0600) — type to replace" : "bearer token (optional)"}
+                        onChange={e=>setMcpServers(p=>p.map((s,i)=>i===idx?{...s,authToken:e.target.value}:s))}
+                        // Saved on blur, not on every keystroke — then dropped from React
+                        // state so the token isn't sitting in the webview's memory either.
+                        onBlur={async e=>{
+                          const v = e.target.value.trim();
+                          if (!v) return;
+                          try {
+                            await invoke("save_secret", { key: mcpSecretKey(srv.id), value: v });
+                            setMcpServers(p=>p.map((s,i)=>i===idx?{...s,authToken:"",hasToken:true}:s));
+                          } catch(err) { logError("save mcp token", err); }
+                        }}
                         style={{ width:150, background:"var(--tny-code)", border:"1px solid var(--tny-line)", color:"var(--tny-tx3)", borderRadius:5, padding:"4px 7px", fontSize:11, fontFamily:"'JetBrains Mono',monospace", outline:"none" }}/>
                     </>
                   )}
