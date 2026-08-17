@@ -11,7 +11,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "eval": "npx promptfoo@latest eval --config evals/promptfoo.yaml",
-    "eval:view": "npx promptfoo@latest view"
+    "eval:view": "npx promptfoo@latest view",
+    "okf-check": "node scripts/okf-check.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

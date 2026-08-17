@@ -16,6 +16,7 @@ import { DevInspectPanel } from "./components/DevInspectPanel.jsx";
 import { InboxPanel } from "./components/InboxPanel.jsx";
 import { OpsPanel } from "./components/OpsPanel.jsx";
 import { ComparePanel } from "./components/ComparePanel.jsx";
+import { stampMemory, stripFrontmatter, isMemoryPath, memoryNameFromPath, RESERVED_NAMES } from "./memoryOkf.js";
 
 // ── Theme bootstrap — runs at module load, before React mounts ────────────────
 // Applies data-theme immediately so CSS variables are correct on first paint.
@@ -310,10 +311,12 @@ EXCEPTION — skip the plan and just act for:
 MEMORY UPDATE HABIT:
 When you learn something worth remembering across sessions (a user preference, project constraint, key fact, or correction to a wrong assumption), proactively save it:
 1. read_file ~/TonyAI-Projects/memory/global.md
-2. Append a concise bullet under "## Learned Facts" (create section if missing)
-3. write_file the updated content back
+2. Append a concise bullet under "## Learned Facts" (create section if missing), ending with an evidence tag saying HOW you know it:
+   [ran] you executed it and saw the result · [read: <path or url>] you read it there · [told: user] the user (or a tool/API) said so · [recalled] from your own training
+   e.g. "- vitest suite passes 242 tests [ran]"  ·  "- Tony prefers minimal code [told: user]"
+3. write_file the updated content back. Keep the file's leading --- frontmatter block exactly as is (it is stamped automatically).
 4. Tell the user "I've saved this to memory: [what you saved]"
-Save facts not conversation. 1-2 lines per fact. Do this during the task, not only at the end.
+Save facts not conversation. 1-2 lines per fact. Never write a fact without a tag; if unsure which, it is [told: user] or [recalled], not [ran]. Do this during the task, not only at the end.
 
 COMPLETION SIGNAL:
 When you have fully answered the request and no more tool calls are needed, end your final response with exactly this on its own line: TASK_COMPLETE`,
@@ -1293,7 +1296,7 @@ async function runSubagent({ role, task, model, signal, braveApiKey, onProgress,
             else if (fnName === "list_dir")     toolResult = await invoke("tool_list_dir",     { path: fnArgs.path });
             else if (fnName === "search_files") toolResult = await invoke("tool_search_files", { dir: fnArgs.dir, pattern: fnArgs.pattern, extensions: fnArgs.extensions ?? null, maxResults: fnArgs.max_results ?? null });
             else if (fnName === "run_command")  toolResult = await invoke("tool_run_command",  { command: fnArgs.command, timeoutSeconds: null });
-            else if (fnName === "write_file")   toolResult = await invoke("tool_write_file",   { path: fnArgs.path, content: fnArgs.content });
+            else if (fnName === "write_file")   toolResult = await invoke("tool_write_file",   { path: fnArgs.path, content: isMemoryPath(fnArgs.path) ? stampMemory(fnArgs.content, { name: memoryNameFromPath(fnArgs.path), by: `tonyai/${model || "agent"}` }) : fnArgs.content });
             else if (fnName === "edit_file")    toolResult = await invoke("tool_edit_file",    { path: fnArgs.path, oldString: fnArgs.old_string, newString: fnArgs.new_string, replaceAll: fnArgs.replace_all ?? null });
             else toolResult = `Unknown tool: ${fnName}`;
             step.status = "done";
@@ -2568,7 +2571,7 @@ export default function App() {
         // Disk files exist — use their text, keep attachments from old format
         const modes = { ...baseMemory.modes };
         for (const [key, text] of Object.entries(files)) {
-          if (key === "global") continue;
+          if (key === "global" || RESERVED_NAMES.has(key.toLowerCase())) continue;
           modes[key] = { ...(modes[key] || {}), text };
         }
         baseMemory = {
@@ -2676,13 +2679,13 @@ export default function App() {
         try {
           await invoke("save_memory_file", {
             name: "global",
-            content: next.global?.text || "",
+            content: stampMemory(next.global?.text || "", { name: "global", by: "human:user" }),
           });
         } catch {}
         for (const [modeId, modeData] of Object.entries(next.modes || {})) {
           if (modeData?.text !== undefined) {
             try {
-              await invoke("save_memory_file", { name: modeId, content: modeData.text || "" });
+              await invoke("save_memory_file", { name: modeId, content: stampMemory(modeData.text || "", { name: modeId, by: "human:user" }) });
             } catch {}
           }
         }
@@ -2973,7 +2976,7 @@ export default function App() {
       // Per-mode memory: global notes always injected; mode-specific notes injected only for this mode
       const globalMem   = memory.global || { text: "", attachments: [] };
       const modeMem     = (memory.modes || {})[effectiveMode] || { text: "" };
-      const memText     = [globalMem.text?.trim(), modeMem.text?.trim()].filter(Boolean).join("\n");
+      const memText     = [stripFrontmatter(globalMem.text || "").trim(), stripFrontmatter(modeMem.text || "").trim()].filter(Boolean).join("\n");
       const memFiles    = (globalMem.attachments || []).filter(a => a.type === "text");
       const memSection = (memText || memFiles.length > 0)
         ? `\n\n[PERSISTENT MEMORY — facts you always know about the user]\n${memText}${
@@ -3029,7 +3032,7 @@ single-file or read-only tasks.
 
 Always complete the task fully. When done, end with TASK_COMPLETE on its own line.
 
-MEMORY: If you learn a user preference, project constraint, correction, or recurring fact during this task — save it: read_file ~/TonyAI-Projects/memory/global.md → append bullet under "## Learned Facts" → write_file back → tell user what you saved.`;
+MEMORY: If you learn a user preference, project constraint, correction, or recurring fact during this task — save it: read_file ~/TonyAI-Projects/memory/global.md → append bullet under "## Learned Facts" ending with an evidence tag ([ran] | [read: path/url] | [told: user] | [recalled]) → write_file back (keep the leading --- frontmatter block untouched) → tell user what you saved.`;
       }
 
       // Arb bot RAG injection
@@ -3526,7 +3529,7 @@ After getting results, give your final answer in normal markdown. Never include 
                       turnCheckpoint.mutatedPaths.add(fnArgs.path);
                     } catch {}
                     toolResult = fnName === "write_file"
-                      ? await invoke("tool_write_file", { path: fnArgs.path, content: fnArgs.content })
+                      ? await invoke("tool_write_file", { path: fnArgs.path, content: isMemoryPath(fnArgs.path) ? stampMemory(fnArgs.content, { name: memoryNameFromPath(fnArgs.path), by: `tonyai/${model || "agent"}` }) : fnArgs.content })
                       : await invoke("tool_edit_file",  { path: fnArgs.path, oldString: fnArgs.old_string, newString: fnArgs.new_string, replaceAll: fnArgs.replace_all ?? null });
                     // Verify nudge — appended for runnable code files so the model is
                     // forced to run and check [exit 0] before declaring completion.
