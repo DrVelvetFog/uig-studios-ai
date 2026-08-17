@@ -17,6 +17,11 @@ import { InboxPanel } from "./components/InboxPanel.jsx";
 import { OpsPanel } from "./components/OpsPanel.jsx";
 import { ComparePanel } from "./components/ComparePanel.jsx";
 import { stampMemory, stripFrontmatter, isMemoryPath, memoryNameFromPath, RESERVED_NAMES } from "./memoryOkf.js";
+import { rvScope, rvWrapCommand, parseRvReport, stripRvReport, rvUndoCommand } from "./rv.js";
+
+// rv (reversible shell actions) — set at bootstrap if ~/reversible/rv is executable.
+// When present, run_command inside a git repo is journaled and undoable (see rv.js).
+let RV_AVAILABLE = false;
 
 // ── Theme bootstrap — runs at module load, before React mounts ────────────────
 // Applies data-theme immediately so CSS variables are correct on first paint.
@@ -1290,12 +1295,22 @@ async function runSubagent({ role, task, model, signal, braveApiKey, onProgress,
                 checkpoint.mutatedPaths.add(fnArgs.path);
               } catch {}
             }
+            {
+              const pathArg = fnArgs.path || fnArgs.dir || fnArgs.repo_path;
+              if (checkpoint && typeof pathArg === "string" && pathArg.startsWith("/")) checkpoint.lastToolDir = pathArg.slice(0, pathArg.lastIndexOf("/")) || pathArg;
+            }
             if      (fnName === "web_search")   toolResult = wrapUntrustedContent(`web_search: ${fnArgs.query}`, await invoke("tool_web_search", { query: fnArgs.query, braveApiKey: braveApiKey||"" }));
             else if (fnName === "fetch_url")    toolResult = wrapUntrustedContent(fnArgs.url, await invoke("tool_fetch_url", { url: fnArgs.url }));
             else if (fnName === "read_file")    toolResult = await invoke("tool_read_file",    { path: fnArgs.path, offset: fnArgs.offset ?? null, limit: fnArgs.limit ?? null });
             else if (fnName === "list_dir")     toolResult = await invoke("tool_list_dir",     { path: fnArgs.path });
             else if (fnName === "search_files") toolResult = await invoke("tool_search_files", { dir: fnArgs.dir, pattern: fnArgs.pattern, extensions: fnArgs.extensions ?? null, maxResults: fnArgs.max_results ?? null });
-            else if (fnName === "run_command")  toolResult = await invoke("tool_run_command",  { command: fnArgs.command, timeoutSeconds: null });
+            else if (fnName === "run_command") {
+              const scope = RV_AVAILABLE && checkpoint ? rvScope(fnArgs.command, checkpoint.lastToolDir) : null;
+              const raw = await invoke("tool_run_command", { command: scope ? rvWrapCommand(fnArgs.command, scope, { actor: `tonyai/${model || "agent"}` }) : fnArgs.command, timeoutSeconds: null });
+              const rep = scope ? parseRvReport(raw) : null;
+              if (rep) { checkpoint.rvActions.push({ ...rep, command: fnArgs.command }); if (scope) checkpoint.lastToolDir = scope; toolResult = stripRvReport(raw); }
+              else toolResult = raw;
+            }
             else if (fnName === "write_file")   toolResult = await invoke("tool_write_file",   { path: fnArgs.path, content: isMemoryPath(fnArgs.path) ? stampMemory(fnArgs.content, { name: memoryNameFromPath(fnArgs.path), by: `tonyai/${model || "agent"}` }) : fnArgs.content });
             else if (fnName === "edit_file")    toolResult = await invoke("tool_edit_file",    { path: fnArgs.path, oldString: fnArgs.old_string, newString: fnArgs.new_string, replaceAll: fnArgs.replace_all ?? null });
             else toolResult = `Unknown tool: ${fnName}`;
@@ -2539,6 +2554,9 @@ export default function App() {
       initMcpServer(srv); // fire-and-forget; errors update server status
     }
 
+    // rv availability (reversible shell actions) — probe once
+    try { RV_AVAILABLE = /RV_OK/.test(String(await invoke("tool_run_command", { command: "test -x ~/reversible/rv && echo RV_OK", timeoutSeconds: 5 }))); } catch { RV_AVAILABLE = false; }
+
     // Load persistent memory:
     //   Priority 1: disk .md files in ~/TonyAI-Projects/memory/ (new, human-readable)
     //   Priority 2: ~/.tonyai/memory.md JSON blob (old format — used for attachments + migration)
@@ -2823,6 +2841,19 @@ export default function App() {
     } catch(e) {
       setMessages(prev => prev.map((m, j) => j === msgIdx ? { ...m, reverted: `Revert failed: ${e}` } : m));
     }
+  }
+
+  // rv: undo the worktree effects of every journaled command in this turn (newest first)
+  async function undoRvActions(msgIdx) {
+    const msg = messages[msgIdx];
+    const acts = msg?.checkpoint?.commands || [];
+    if (!acts.length || msg.rvUndone) return;
+    const lines = [];
+    for (const a of [...acts].reverse()) {
+      try { lines.push(`#${a.seq}: ` + String(await invoke("tool_run_command", { command: rvUndoCommand(a), timeoutSeconds: 60 })).split("\n").filter(l => /restored|skipped|SKIP|note:/.test(l)).join(" · ")); }
+      catch (e) { lines.push(`#${a.seq}: undo failed: ${e}`); }
+    }
+    setMessages(prev => prev.map((m, j) => j === msgIdx ? { ...m, rvUndone: lines.join("\n") } : m));
   }
 
   // ── Background process handlers ───────────────────────────────────────────
@@ -3139,7 +3170,7 @@ MEMORY: If you learn a user preference, project constraint, correction, or recur
         // (including inside subagents) is snapshotted under this id so the
         // whole turn can be reverted with one click.
         const checkpointId = `ckpt_${Date.now()}`;
-        const turnCheckpoint = { id: checkpointId, mutatedPaths: new Set() };
+        const turnCheckpoint = { id: checkpointId, mutatedPaths: new Set(), rvActions: [], lastToolDir: null };
 
         // Per-project instructions: track which TONYAI.md files we've already
         // injected this turn, and which directories we've already probed.
@@ -3512,7 +3543,13 @@ After getting results, give your final answer in normal markdown. Never include 
                   else if (fnName === "read_file")    toolResult = await invoke("tool_read_file",    { path: fnArgs.path, offset: fnArgs.offset ?? null, limit: fnArgs.limit ?? null });
                   else if (fnName === "list_dir")     toolResult = await invoke("tool_list_dir",     { path: fnArgs.path });
                   else if (fnName === "search_files") toolResult = await invoke("tool_search_files", { dir: fnArgs.dir, pattern: fnArgs.pattern, extensions: fnArgs.extensions ?? null, maxResults: fnArgs.max_results ?? null });
-                  else if (fnName === "run_command")  toolResult = await invoke("tool_run_command",  { command: fnArgs.command, timeoutSeconds: fnArgs.timeout_seconds ?? null });
+                  else if (fnName === "run_command") {
+                    const scope = RV_AVAILABLE ? rvScope(fnArgs.command, turnCheckpoint.lastToolDir) : null;
+                    const raw = await invoke("tool_run_command", { command: scope ? rvWrapCommand(fnArgs.command, scope, { actor: `tonyai/${model || "agent"}` }) : fnArgs.command, timeoutSeconds: fnArgs.timeout_seconds ?? null });
+                    const rep = scope ? parseRvReport(raw) : null;
+                    if (rep) { turnCheckpoint.rvActions.push({ ...rep, command: fnArgs.command }); if (scope) turnCheckpoint.lastToolDir = scope; toolResult = stripRvReport(raw); }
+                    else toolResult = raw;
+                  }
                   else if (fnName === "run_background") { toolResult = await invoke("tool_run_background", { command: fnArgs.command }); refreshBgProcs(); }
                   else if (fnName === "process_status") { toolResult = await invoke("tool_process_status", { id: fnArgs.id, tailChars: fnArgs.tail_chars ?? null }); refreshBgProcs(); }
                   else if (fnName === "process_kill")   { toolResult = await invoke("tool_process_kill",   { id: fnArgs.id }); refreshBgProcs(); }
@@ -3732,6 +3769,7 @@ After getting results, give your final answer in normal markdown. Never include 
               const pathArg = fnArgs.path || fnArgs.dir || fnArgs.repo_path;
               if (typeof pathArg === "string" && pathArg.startsWith("/")) {
                 const probeDir = pathArg.slice(0, pathArg.lastIndexOf("/")) || pathArg;
+                turnCheckpoint.lastToolDir = probeDir;   // rv scope fallback for later run_command
                 if (!probedInstructionDirs.has(probeDir)) {
                   probedInstructionDirs.add(probeDir);
                   try {
@@ -3843,7 +3881,7 @@ After getting results, give your final answer in normal markdown. Never include 
               const u = [...prev];
               const last = u[u.length-1];
               if (last?.type === "tool_step") {
-                u[u.length-1] = { ...last, checkpoint: { id: checkpointId, files: [...turnCheckpoint.mutatedPaths] } };
+                u[u.length-1] = { ...last, checkpoint: { id: checkpointId, files: [...turnCheckpoint.mutatedPaths], commands: turnCheckpoint.rvActions.filter(a => a.changed) } };
               }
               return u;
             });
@@ -4807,6 +4845,22 @@ After getting results, give your final answer in normal markdown. Never include 
                                 {msg.checkpoint.files.map(f=>f.split("/").pop()).join(", ")}
                               </span>
                             </div>
+                          )}
+                          {/* rv — undo the file effects of shell commands this turn (journaled in <repo>/.git/rv) */}
+                          {msg.checkpoint?.commands?.length > 0 && !msg.rvUndone && (
+                            <div style={{ marginTop:6, display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
+                              <button onClick={()=>undoRvActions(i)}
+                                title={`Undo worktree effects of:\n${msg.checkpoint.commands.map(a=>`#${a.seq} ${a.command}`).join("\n")}\n(per-path restore; files edited since are skipped)`}
+                                style={{ background:"rgba(251,146,60,0.08)", border:"1px solid rgba(251,146,60,0.3)", color:"#fb923c", cursor:"pointer", borderRadius:6, padding:"4px 12px", fontSize:11, fontFamily:"inherit", fontWeight:500 }}>
+                                ↩ Undo {msg.checkpoint.commands.length} command effect{msg.checkpoint.commands.length>1?"s":""}
+                              </button>
+                              <span style={{ fontSize:10, color:"var(--tny-tx5)", fontFamily:"'JetBrains Mono',monospace", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", maxWidth:340 }}>
+                                {msg.checkpoint.commands.map(a=>a.command.slice(0,40)).join(" · ")}
+                              </span>
+                            </div>
+                          )}
+                          {msg.rvUndone && (
+                            <div style={{ marginTop:8, fontSize:11, color:"#fb923c", fontFamily:"'JetBrains Mono',monospace", whiteSpace:"pre-wrap" }}>↩ {msg.rvUndone}</div>
                           )}
                           {msg.reverted && (
                             <div style={{ marginTop:8, fontSize:11, color:"#fb923c", fontFamily:"'JetBrains Mono',monospace" }}>
