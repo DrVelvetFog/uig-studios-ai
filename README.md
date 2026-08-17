@@ -4,6 +4,8 @@ A local-first desktop AI agent. Tauri 2 + React + Rust, driving Ollama models on
 
 > Status: personal tool, macOS (Apple Silicon) only, built from source. Not a product. See [Status](#status).
 
+![First run](docs/screenshots/first-run-dark.png)
+
 ## What makes it different
 
 Most agent apps ask you to trust the transcript. UIG Studios AI records things a stranger could check:
