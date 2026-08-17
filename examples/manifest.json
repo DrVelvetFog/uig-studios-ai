@@ -1,0 +1,16 @@
+{
+  "package": "tonyai",
+  "version_cmd": "node -p \"require('./package.json').version\"",
+  "examples": [
+    {
+      "id": "okf-check-fixture",
+      "path": "examples/memory-fixture/global.md",
+      "command": "node scripts/okf-check.mjs examples/memory-fixture"
+    },
+    {
+      "id": "unit-tests",
+      "path": "package.json",
+      "command": "npx vitest run >/dev/null 2>&1 && echo 'vitest: all tests passed'"
+    }
+  ]
+}

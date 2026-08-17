@@ -1,0 +1,9 @@
+# TonyAI
+
+> Local-first desktop AI agent (Tauri + React + Rust + Ollama). Private repo.
+
+## Verified examples
+
+- [manifest](examples/manifest.json): runnable examples for tonyai
+- [attestations](examples/attest.json): in-toto Statements — which version each example last ran against, exit code, output digest
+- Check before use: `xv check --rerun` (https://github.com/DrVelvetFog/verified-examples)

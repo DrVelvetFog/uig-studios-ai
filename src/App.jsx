@@ -1166,6 +1166,10 @@ Do not ask questions. Deliver research. End with TASK_COMPLETE on its own line.`
 existing files with edit_file (exact search/replace — read_file first to copy the exact text).
 Use list_dir to explore existing structure first. After writing, run the entry point with
 run_command to verify it works. Report: what files you created and whether the run succeeded.
+VERIFIED EXAMPLES: before writing code against a library or repo, check whether it ships attested
+examples — an examples/attest.json, or an llms.txt with a "Verified examples" section. If so, run
+`cd <repo> && ~/verified-examples/xv check --rerun` and imitate only examples reported VERIFIED;
+treat STALE/MODIFIED/FAILED ones as prose. Never invent an API surface when a verified example exists.
 End with TASK_COMPLETE on its own line.`,
     tools: ["write_file", "edit_file", "read_file", "search_files", "list_dir", "run_command"],
   },

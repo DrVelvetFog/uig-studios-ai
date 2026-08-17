@@ -1,0 +1,65 @@
+{
+ "schema": "verified-examples/v0",
+ "attestations": [
+  {
+   "_type": "https://in-toto.io/Statement/v1",
+   "subject": [
+    {
+     "name": "examples/memory-fixture/global.md",
+     "digest": {
+      "sha256": "f89478fb25f64f2c69393599037e41bd65038db7d125a19938f3868f1dcd7aa4"
+     }
+    }
+   ],
+   "predicateType": "https://github.com/DrVelvetFog/verified-examples/v0",
+   "predicate": {
+    "id": "okf-check-fixture",
+    "package": "tonyai",
+    "version": "1.3.1",
+    "command": "node scripts/okf-check.mjs examples/memory-fixture",
+    "exit": 0,
+    "stdout": {
+     "sha256": "713ee9054f5357e8cc414d6099b6aaa5cfa129af2924b149ab073a52e27096c8",
+     "bytes": 112,
+     "tail": "OKF bundle: examples/memory-fixture\n  ok   global.md  status=stable  facts=4 tagged=3  (ran=1 read=1 told=1)\nOK\n"
+    },
+    "ran_at": "2026-08-17T14:57:01Z",
+    "runner": {
+     "os": "darwin",
+     "python": "3.14.6",
+     "ci": false
+    }
+   }
+  },
+  {
+   "_type": "https://in-toto.io/Statement/v1",
+   "subject": [
+    {
+     "name": "package.json",
+     "digest": {
+      "sha256": "80b3619d3c523dfba10dd4c210fddb83f3bcad33254f8f8b00cc39e9d297b697"
+     }
+    }
+   ],
+   "predicateType": "https://github.com/DrVelvetFog/verified-examples/v0",
+   "predicate": {
+    "id": "unit-tests",
+    "package": "tonyai",
+    "version": "1.3.1",
+    "command": "npx vitest run >/dev/null 2>&1 && echo 'vitest: all tests passed'",
+    "exit": 0,
+    "stdout": {
+     "sha256": "e12322c2c5069ec00a614e451570820cc117d0f926f3e4ece10d6db9d753e041",
+     "bytes": 25,
+     "tail": "vitest: all tests passed\n"
+    },
+    "ran_at": "2026-08-17T14:57:02Z",
+    "runner": {
+     "os": "darwin",
+     "python": "3.14.6",
+     "ci": false
+    }
+   }
+  }
+ ]
+}
