@@ -343,3 +343,13 @@ describe("stranger's-seat safety pass (2026-08-17)", () => {
     expect(approvalReason("web_search", { query: "rust tokio select" }, { sawWebContent: true })).toBeNull();
   });
 });
+
+describe("data-dir migration keeps both app dirs protected", () => {
+  it("~/.uigai secrets are credential stores too", async () => {
+    const { guardToolCall } = await import("./toolGuard.js");
+    expect(guardToolCall("read_file", { path: "~/.uigai/secret-openai.txt" }).blocked).toBe(true);
+    expect(guardToolCall("read_file", { path: "~/.uigai/secret-notary.env" }).blocked).toBe(true);
+    expect(guardToolCall("run_command", { command: "cat $HOME/.uigai/secret-custom.txt" }).blocked).toBe(true);
+    expect(guardToolCall("read_file", { path: "~/.uigai/ops.json" }).blocked).toBe(false);
+  });
+});

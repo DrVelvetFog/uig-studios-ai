@@ -29,16 +29,60 @@ fn home_dir_var() -> Result<String, String> {
         .map_err(|_| "No home directory: neither HOME nor USERPROFILE is set".to_string())
 }
 
+/// App config/state dir: ~/.uigai (formerly ~/.tonyai — migrated once at startup, see migrate_legacy_dirs).
+const APP_DIR: &str = ".uigai";
+const LEGACY_APP_DIR: &str = ".tonyai";
+/// User-facing folders live under ~/UIG-AI/<Name> (formerly ~/TonyAI-<Name>).
+const USER_ROOT: &str = "UIG-AI";
+
 fn tonyai_dir() -> Result<PathBuf, String> {
     let home = home_dir_var()?;
-    let dir = PathBuf::from(home).join(".tonyai");
+    let dir = PathBuf::from(home).join(APP_DIR);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir)
 }
 
+/// ~/UIG-AI/<name> (created on demand).
+fn user_dir(name: &str) -> Result<PathBuf, String> {
+    let home = home_dir_var()?;
+    let dir = PathBuf::from(home).join(USER_ROOT).join(name);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+/// One-time, idempotent move of the legacy layout to the current one. Never overwrites:
+/// a rename happens only when the new location does not exist yet. Leaves a symlink at
+/// the old location so scripts and shell habits keep working. The Python sandbox is NOT
+/// moved (a relocated venv breaks); it is recreated on first use.
+fn migrate_legacy_dirs() -> Vec<String> {
+    let mut moved = Vec::new();
+    let Ok(home) = home_dir_var() else { return moved; };
+    let home = PathBuf::from(home);
+    let mut pairs: Vec<(PathBuf, PathBuf)> = vec![(home.join(LEGACY_APP_DIR), home.join(APP_DIR))];
+    for name in ["Projects", "Exports", "Documents", "Images"] {
+        pairs.push((home.join(format!("TonyAI-{name}")), home.join(USER_ROOT).join(name)));
+    }
+    for (old, new) in pairs {
+        let old_is_link = std::fs::symlink_metadata(&old).map(|m| m.file_type().is_symlink()).unwrap_or(false);
+        if old_is_link || !old.exists() || new.exists() { continue; }
+        if let Some(parent) = new.parent() { let _ = std::fs::create_dir_all(parent); }
+        if std::fs::rename(&old, &new).is_ok() {
+            #[cfg(unix)]
+            { let _ = std::os::unix::fs::symlink(&new, &old); }
+            moved.push(format!("{} → {}", old.display(), new.display()));
+        }
+    }
+    moved
+}
+
+#[tauri::command]
+fn migrate_legacy_layout() -> Result<String, String> {
+    Ok(serde_json::to_string(&migrate_legacy_dirs()).unwrap_or_else(|_| "[]".into()))
+}
+
 /// ── General Knowledge Base ───────────────────────────────────────────────────
 /// Separate from the code RAG index. Reads any text-based file recursively
-/// from a user-configured directory (default: ~/TonyAI-Documents/).
+/// from a user-configured directory (default: ~/UIG-AI/Documents/).
 
 #[tauri::command]
 fn read_knowledge_index() -> Result<String, String> {
@@ -404,7 +448,7 @@ fn read_secret(key: String) -> Result<String, String> {
 }
 
 // ── Diagnostic log ────────────────────────────────────────────────────────────
-// Appends a single pre-formatted line to ~/.tonyai/logs/tonyai.log. Rotates to
+// Appends a single pre-formatted line to ~/.uigai/logs/tonyai.log. Rotates to
 // tonyai.log.1 once the file exceeds 2 MB so it can't grow unbounded.
 #[tauri::command]
 fn append_log(line: String) -> Result<(), String> {
@@ -508,12 +552,12 @@ fn read_telemetry() -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| e.to_string())
 }
 
-/// Read all memory .md files from ~/TonyAI-Projects/memory/.
+/// Read all memory .md files from ~/UIG-AI/Projects/memory/.
 /// Returns JSON object: { "global": "...", "chat": "...", ... }
 #[tauri::command]
 fn read_memory_files() -> Result<String, String> {
     let home = home_dir_var()?;
-    let dir = PathBuf::from(&home).join("TonyAI-Projects").join("memory");
+    let dir = PathBuf::from(&home).join(USER_ROOT).join("Projects").join("memory");
     if !dir.exists() {
         return Ok("{}".to_string());
     }
@@ -534,12 +578,12 @@ fn read_memory_files() -> Result<String, String> {
     serde_json::to_string(&map).map_err(|e| e.to_string())
 }
 
-/// Write a single memory .md file to ~/TonyAI-Projects/memory/{name}.md.
+/// Write a single memory .md file to ~/UIG-AI/Projects/memory/{name}.md.
 /// name must be alphanumeric (e.g. "global", "chat", "code").
 #[tauri::command]
 fn save_memory_file(name: String, content: String) -> Result<(), String> {
     let home = home_dir_var()?;
-    let dir = PathBuf::from(&home).join("TonyAI-Projects").join("memory");
+    let dir = PathBuf::from(&home).join(USER_ROOT).join("Projects").join("memory");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     // Sanitise name — alphanumeric and underscores only
     let safe: String = name.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
@@ -769,7 +813,7 @@ fn cloud_request(provider: &str, url: &str, body: String, timeout_s: u64) -> Res
     if !key.is_empty() { req = req.header("Authorization", format!("Bearer {}", key)); }
     if provider == "openrouter" {
         req = req
-            .header("HTTP-Referer", "https://github.com/DrVelvetFog/tonyai")
+            .header("HTTP-Referer", "https://github.com/DrVelvetFog/uig-studios-ai")
             .header("X-Title", "UIG Studios AI");
     }
     Ok(req.body(body))
@@ -1852,7 +1896,7 @@ fn save_generated_image(
     let safe_stem   = filename_stem.replace(['/', '\\'], "-");
 
     let dir = std::path::PathBuf::from(&home)
-        .join("TonyAI-Images")
+        .join(USER_ROOT).join("Images")
         .join(&safe_subdir);
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir failed: {e}"))?;
 
@@ -1985,7 +2029,7 @@ async fn tool_git_blame(repo_path: String, file: String, line_start: Option<u32>
     run_git(args_ref, &repo_path).await
 }
 
-/// Execute Python code in a sandboxed environment (~/TonyAI-Sandbox/).
+/// Execute Python code in a sandboxed environment (~/UIG-AI/Sandbox/).
 /// - Code runs in an isolated directory, not the user's project tree
 /// - Optional pip packages auto-installed into a dedicated venv on first use
 /// - Configurable timeout (default 60s, max 300s)
@@ -1998,7 +2042,7 @@ async fn tool_python_exec(
     timeout_seconds: Option<u64>,
 ) -> Result<String, String> {
     let home = home_dir_var()?;
-    let sandbox = std::path::PathBuf::from(&home).join("TonyAI-Sandbox");
+    let sandbox = std::path::PathBuf::from(&home).join(USER_ROOT).join("Sandbox");
     std::fs::create_dir_all(&sandbox).map_err(|e| format!("mkdir sandbox: {e}"))?;
 
     let venv_dir = sandbox.join(".venv");
@@ -2135,7 +2179,7 @@ fn find_project_instructions(path: String) -> Result<String, String> {
 
     let home_path = PathBuf::from(&home);
     loop {
-        let candidate = dir.join("TONYAI.md");
+        let candidate = if dir.join("UIGAI.md").exists() { dir.join("UIGAI.md") } else { dir.join("TONYAI.md") };
         if candidate.is_file() {
             let mut content = std::fs::read_to_string(&candidate).unwrap_or_default();
             if content.chars().count() > 8000 {
@@ -3091,6 +3135,7 @@ async fn mcp_list_servers(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let _ = migrate_legacy_dirs();   // ~/.tonyai → ~/.uigai, ~/TonyAI-* → ~/UIG-AI/* (once, never overwrites)
     tauri::Builder::default()
         .manage(StreamCancelMap::new())
         .manage(McpManager::new())
@@ -3100,6 +3145,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
+            migrate_legacy_layout,
             read_rag_index,
             save_rag_index,
             read_source_files,

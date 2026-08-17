@@ -2,7 +2,7 @@
 /**
  * UIG Studios AI Background Monitor
  * Runs every 5 minutes via launchd.
- * Writes findings to ~/.tonyai/inbox.json
+ * Writes findings to ~/.uigai/inbox.json
  * Sends macOS notifications for critical findings.
  */
 
@@ -17,11 +17,11 @@ import { runOpsChecks, runDailyBrief }        from "./ops.mjs";
 process.env.PATH = `/opt/homebrew/bin:${process.env.PATH || "/usr/bin:/bin"}`;
 
 const HOME       = homedir();
-const TONYAI_DIR = join(HOME, ".tonyai");
+const TONYAI_DIR = join(HOME, ".uigai");
 const INBOX      = join(TONYAI_DIR, "inbox.json");
 const OLLAMA_URL = "http://127.0.0.1:11434";
 
-// Ensure ~/.tonyai exists
+// Ensure ~/.uigai exists
 mkdirSync(TONYAI_DIR, { recursive: true });
 
 // ── Inbox helpers ─────────────────────────────────────────────────────────────

@@ -14,7 +14,7 @@ Most agent apps ask you to trust the transcript. UIG Studios AI records things a
 - **Evidence tiers, stamped by code.** Every tool step is tagged by *what kind of tool it is* — `ran` (executed), `read` (file/URL/RAG), `told` (web search, MCP, another agent) — never by the model. A completed turn shows the strongest tier its steps actually support; the settings table shows **ran-backed %** per model (of completed runs, how many rested on an executed step). Transcript exports carry a `.evidence.json` sidecar of [in-toto Statements](https://github.com/DrVelvetFog/evidence-tier).
 - **Verified examples.** Runnable examples ship with execution attestations (`examples/attest.json`, gated in CI). The coder subagent looks for the same in libraries it uses and imitates only examples reported VERIFIED ([xv](https://github.com/DrVelvetFog/verified-examples)).
 - **Portable memory.** Persistent memory is a directory of markdown files in [Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog) with `generated: { by, at }` stamped on every write (agent vs human), and each learned fact ends with an evidence tag — `[ran]` `[read: path]` `[told: user]` `[recalled]`. `npm run okf-check` validates the bundle.
-- **Safety gates that don't depend on the model.** Hard denylist of catastrophic operations; **credential stores (`~/.ssh`, `~/.aws`, keychains, the app's own secret files, signing keys) are unreadable by every tool**, and secret-looking tokens are refused in outbound URLs/queries/MCP args — closing the read-then-exfiltrate chain; approval prompt for anything mutating (with an allowlist for "always allow" that force-push, publish, prune and file uploads can never satisfy); `.env` reads ask; prompt-injection scanning on all web/MCP content; and a provenance flag: once untrusted content enters the context, mutating tools — and long/blob-like outbound requests — require human approval for the rest of the turn regardless of allowlists. Secrets live in `~/.tonyai/secret-*.txt` (mode 0600), never in the webview.
+- **Safety gates that don't depend on the model.** Hard denylist of catastrophic operations; **credential stores (`~/.ssh`, `~/.aws`, keychains, the app's own secret files, signing keys) are unreadable by every tool**, and secret-looking tokens are refused in outbound URLs/queries/MCP args — closing the read-then-exfiltrate chain; approval prompt for anything mutating (with an allowlist for "always allow" that force-push, publish, prune and file uploads can never satisfy); `.env` reads ask; prompt-injection scanning on all web/MCP content; and a provenance flag: once untrusted content enters the context, mutating tools — and long/blob-like outbound requests — require human approval for the rest of the turn regardless of allowlists. Secrets live in `~/.uigai/secret-*.txt` (mode 0600), never in the webview.
 - **A stop condition the model can't talk its way past.** "Task complete" is rejected unless code that was written was also run with `[exit 0]`; queries about current events are rejected without a search that actually ran.
 
 ## What it does
@@ -23,7 +23,7 @@ Most agent apps ask you to trust the transcript. UIG Studios AI records things a
 - **Agent loop:** hand-rolled ReAct loop over native Ollama tool calling (with a prompt-JSON fallback for models without tool support). Tools: `web_search` / `deep_search` / `fetch_url`, `read_file` / `write_file` / `edit_file` / `list_dir` / `search_files`, `run_command` / `run_background` / `process_*`, `python_exec` (sandboxed venv), read-only `git_*`, `search_knowledge` (RAG), `search_sessions`, `propose_plan`, `spawn_subagent` (researcher / coder / verifier / fixer; coder auto-chains coder → verifier → fixer).
 - **MCP client** in Rust — stdio and streamable-HTTP transports, tools namespaced `mcp__<server>__<tool>`, always behind approval.
 - **Models:** local Ollama with model-fit indicators for your RAM (context clamped for big models) — including any GGUF on Hugging Face via `ollama pull hf.co/<user>/<repo>`; OpenRouter and OpenAI as an explicit cloud tier with per-session cost; **any OpenAI-compatible endpoint** (Hugging Face Inference Providers, LM Studio, vLLM, llama.cpp server) as a custom provider; blind A/B compare with vote-then-reveal.
-- **Memory & context:** two RAG indexes (code + knowledge base, hybrid vector + keyword), two-level context compaction, per-project `TONYAI.md` instructions auto-injected when tools touch a project tree.
+- **Memory & context:** two RAG indexes (code + knowledge base, hybrid vector + keyword), two-level context compaction, per-project `UIGAI.md` (or legacy `TONYAI.md`) instructions auto-injected when tools touch a project tree.
 - **Sessions:** on disk, forkable, auto-exported to markdown; background processes survive the turn and die with the app.
 - **Ops console:** a launchd monitor runs config-driven health checks (HTTP, Sui balances/objects, pm2) every five minutes, posts transitions to an in-app inbox and macOS notifications, and writes a daily brief.
 - **Images:** Automatic1111 and ComfyUI backends with progress and JSON sidecars.
@@ -50,18 +50,18 @@ For a signed (and, with credentials, notarized) build see `scripts/release-signe
 
 Guides: [docs/setup.md](docs/setup.md) (first run, keys, cloud + custom endpoints, MCP servers incl. GitHub, background monitor) · [docs/modes-and-tools.md](docs/modes-and-tools.md) (every mode and tool, subagents, undo, memory).
 
-Everything lives under `~/.tonyai/` and `~/TonyAI-*`:
+Everything lives under `~/.uigai/` and `~/TonyAI-*`:
 
 | Path | What |
 |---|---|
-| `~/.tonyai/secret-<name>.txt` | API keys and MCP tokens, mode 0600. Set them in Settings; the field saves on blur and clears from the UI. |
-| `~/.tonyai/sessions/` · `~/TonyAI-Exports/` | Sessions on disk; markdown transcripts (+ `.evidence.json`). |
-| `~/TonyAI-Projects/memory/` | OKF memory bundle (`index.md`, `global.md`, `<mode>.md`). |
-| `~/TonyAI-Documents/` | Knowledge base indexed for RAG. |
-| `~/TonyAI-Sandbox/` | Python venv used by `python_exec`. |
-| `~/.tonyai/ops.json` | Ops checks (seeded from `scripts/ops-default.json` on first run). |
-| `~/.tonyai/telemetry.jsonl` | Per-run agent stats, local only. |
-| `~/.tonyai/checkpoints/` · `<repo>/.git/rv/` | File checkpoints; rv command journals. |
+| `~/.uigai/secret-<name>.txt` | API keys and MCP tokens, mode 0600. Set them in Settings; the field saves on blur and clears from the UI. |
+| `~/.uigai/sessions/` · `~/UIG-AI/Exports/` | Sessions on disk; markdown transcripts (+ `.evidence.json`). |
+| `~/UIG-AI/Projects/memory/` | OKF memory bundle (`index.md`, `global.md`, `<mode>.md`). |
+| `~/UIG-AI/Documents/` | Knowledge base indexed for RAG. |
+| `~/UIG-AI/Sandbox/` | Python venv used by `python_exec`. |
+| `~/.uigai/ops.json` | Ops checks (seeded from `scripts/ops-default.json` on first run). |
+| `~/.uigai/telemetry.jsonl` | Per-run agent stats, local only. |
+| `~/.uigai/checkpoints/` · `<repo>/.git/rv/` | File checkpoints; rv command journals. |
 
 ## Privacy
 

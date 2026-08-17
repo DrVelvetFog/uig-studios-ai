@@ -1,6 +1,6 @@
 # Modes and tools
 
-UIG Studios AI has one agent loop and several **modes**. A mode fixes three things: the system prompt, which tools the model may call, and which memory scope is injected (global + that mode's file in `~/TonyAI-Projects/memory/`).
+UIG Studios AI has one agent loop and several **modes**. A mode fixes three things: the system prompt, which tools the model may call, and which memory scope is injected (global + that mode's file in `~/UIG-AI/Projects/memory/`).
 
 ## Modes
 
@@ -12,7 +12,7 @@ UIG Studios AI has one agent loop and several **modes**. A mode fixes three thin
 | **Python** | Same as Code, Python-first system prompt | `web_search`, `deep_search`, `fetch_url`, `propose_plan`, `write_file`, `edit_file`, `read_file`, `search_files`, `list_dir`, `run_command`, `run_background`, `process_status`, `process_kill`, `process_list`, `python_exec`, `git_status`, `git_diff`, `git_log`, `git_blame`, `spawn_subagent`, `search_knowledge`, `search_sessions` |
 | **Agent** | Unrestricted orchestrator: every tool, subagents, MCP | all tools + connected MCP tools |
 | **Sui/Move** | Sui blockchain / Move development | `web_search`, `deep_search`, `fetch_url`, `propose_plan`, `write_file`, `edit_file`, `read_file`, `search_files`, `list_dir`, `run_command`, `run_background`, `process_status`, `process_kill`, `process_list`, `python_exec`, `git_status`, `git_diff`, `git_log`, `git_blame`, `spawn_subagent`, `search_knowledge`, `search_sessions` |
-| **Ops** | Reads the background monitor's state (`~/.tonyai/ops-*.json`) and runs health / deep / daily playbooks | same as Code |
+| **Ops** | Reads the background monitor's state (`~/.uigai/ops-*.json`) and runs health / deep / daily playbooks | same as Code |
 | **Image** | Automatic1111 / ComfyUI generation | none (image backends) |
 
 `smart routing` picks a model per mode from the tier lists (local first; cloud only when you select one). Each mode also has its own temperature and context size.
@@ -39,8 +39,8 @@ Every tool call passes two gates before it runs, in code, not in the prompt: the
 | `propose_plan` | Present a structured plan to the user for approval BEFORE executing a complex task (2+ files, state-changing commands, architectural choices). The user sees the plan with Approve / Request-changes buttons; the result tells you their decision. Do not start executing until a plan is APPROVED. Skip planning for simple single-step tasks. |
 | `spawn_subagent` | Spawn an isolated subagent to handle a subtask. coder role auto-runs a verifier after writing code, then a fixer if verification fails — you get a guaranteed-working result. researcher=web search only | coder=write+verify+fix (full pipeline) | verifier=run+inspect | fixer=fix broken code. |
 | `search_sessions` | Search the user's PAST CONVERSATION transcripts (auto-saved session exports). Use when asked about earlier discussions, prior decisions, 'what did we talk about', or to recall context from previous sessions. Returns matching lines as 'file:line: text' — the filenames start with the session date. |
-| `search_knowledge` | Search your personal knowledge base — documents, notes, specs, and files you've added to ~/TonyAI-Documents/. Returns the most relevant passages. Use this to answer questions about your own projects, decisions, preferences, or any documents you've stored. |
-| `python_exec` | Execute Python code in a SANDBOXED environment (~/TonyAI-Sandbox/) — safer than run_command for testing snippets, data analysis, or experimentation. Code runs in an isolated venv, not your project tree. Supports optional pip packages. Returns stdout, stderr, and exit code. Prefer this over run_command for any standalone Python code. |
+| `search_knowledge` | Search your personal knowledge base — documents, notes, specs, and files you've added to ~/UIG-AI/Documents/. Returns the most relevant passages. Use this to answer questions about your own projects, decisions, preferences, or any documents you've stored. |
+| `python_exec` | Execute Python code in a SANDBOXED environment (~/UIG-AI/Sandbox/) — safer than run_command for testing snippets, data analysis, or experimentation. Code runs in an isolated venv, not your project tree. Supports optional pip packages. Returns stdout, stderr, and exit code. Prefer this over run_command for any standalone Python code. |
 | `git_status` | Get a git repo's current state: branch, ahead/behind, staged + unstaged + untracked files, stash count. Use BEFORE making changes to understand the current state. |
 | `git_diff` | Show git diff for working tree (default) or staged changes. Optionally limit to a single file. Use to review what changed before committing or to understand recent edits. |
 | `git_log` | Get recent commit history in one-line format with branch decorations. Optionally limit to a specific file. |
@@ -59,4 +59,4 @@ Evidence tier by tool kind (stamped by code, shown as `evidence:` under each tur
 
 ## Memory
 
-`~/TonyAI-Projects/memory/` is an [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog) bundle: `global.md` (every mode) plus one file per mode. The agent appends bullets under `## Learned Facts`, each ending with an evidence tag — `[ran]`, `[read: path-or-url]`, `[told: user]`, `[recalled]`. Frontmatter (`generated: { by, at }`) is stamped automatically on every write; edit the files by hand whenever you like. `npm run okf-check` validates the bundle.
+`~/UIG-AI/Projects/memory/` is an [OKF](https://github.com/GoogleCloudPlatform/knowledge-catalog) bundle: `global.md` (every mode) plus one file per mode. The agent appends bullets under `## Learned Facts`, each ending with an evidence tag — `[ran]`, `[read: path-or-url]`, `[told: user]`, `[recalled]`. Frontmatter (`generated: { by, at }`) is stamped automatically on every write; edit the files by hand whenever you like. `npm run okf-check` validates the bundle.

@@ -20,14 +20,14 @@ DEV_OK=0; INSTALL=0; RELEASE=0
 for a in "$@"; do case "$a" in --dev-ok) DEV_OK=1;; --install) INSTALL=1;; --release) RELEASE=1;; esac; done
 
 # Notarization + updater-signing creds live outside the repo, same convention as the app's secrets.
-[[ -f "$HOME/.tonyai/secret-notary.env" ]] && source "$HOME/.tonyai/secret-notary.env"
-[[ -f "$HOME/.tonyai/secret-updater.env" ]] && source "$HOME/.tonyai/secret-updater.env"
+[[ -f "$HOME/.uigai/secret-notary.env" ]] && source "$HOME/.uigai/secret-notary.env"
+[[ -f "$HOME/.uigai/secret-updater.env" ]] && source "$HOME/.uigai/secret-updater.env"
 if [[ -n "${TAURI_SIGNING_PRIVATE_KEY_PATH:-}" && -f "$TAURI_SIGNING_PRIVATE_KEY_PATH" ]]; then
   export TAURI_SIGNING_PRIVATE_KEY="$(cat "$TAURI_SIGNING_PRIVATE_KEY_PATH")"   # updater artifacts get signed
   export TAURI_SIGNING_PRIVATE_KEY_PASSWORD
   echo "Updater signing: key at $TAURI_SIGNING_PRIVATE_KEY_PATH"
 else
-  echo "Updater signing: NO KEY (updater .tar.gz/.sig will not be produced) — see ~/.tonyai/secret-updater.env"
+  echo "Updater signing: NO KEY (updater .tar.gz/.sig will not be produced) — see ~/.uigai/secret-updater.env"
 fi
 [[ -n "${APPLE_API_KEY_PATH:-}" ]] && APPLE_API_KEY_PATH="${APPLE_API_KEY_PATH/#\~/$HOME}" && export APPLE_API_KEY_PATH
 if [[ -n "${APPLE_API_KEY:-}" && ! -f "${APPLE_API_KEY_PATH:-/nonexistent}" ]]; then
@@ -82,7 +82,7 @@ ls -1 src-tauri/target/release/bundle/dmg/*.dmg 2>/dev/null || true
 
 # ── Release artifacts: rename (no spaces — GitHub mangles them), write latest.json for the updater ──
 VER=$(python3 -c "import json;print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
-REPO_SLUG="DrVelvetFog/tonyai"
+REPO_SLUG="DrVelvetFog/uig-studios-ai"
 OUT="src-tauri/target/release/bundle/release-v$VER"; rm -rf "$OUT"; mkdir -p "$OUT"
 DMG=$(ls src-tauri/target/release/bundle/dmg/*.dmg | head -1)
 cp "$DMG" "$OUT/UIG-Studios-AI_${VER}_aarch64.dmg"

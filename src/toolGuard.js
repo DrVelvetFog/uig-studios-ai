@@ -53,7 +53,7 @@ const SENSITIVE_BASENAMES = new Set([
 const CREDENTIAL_PATH_RE = new RegExp([
   String.raw`(^|/)\.ssh(/|$)`, String.raw`(^|/)\.aws(/|$)`, String.raw`(^|/)\.gnupg(/|$)`, String.raw`(^|/)\.gpg(/|$)`,
   String.raw`(^|/)\.kube(/|$)`, String.raw`(^|/)\.docker/config\.json$`, String.raw`(^|/)\.private_keys(/|$)`,
-  String.raw`(^|/)\.tauri/[^/]*\.key$`, String.raw`(^|/)\.tonyai/secret-[^/]*$`, String.raw`(^|/)\.tonyai/[^/]*\.env$`,
+  String.raw`(^|/)\.tauri/[^/]*\.key$`, String.raw`(^|/)\.(tonyai|uigai)/secret-[^/]*$`, String.raw`(^|/)\.(tonyai|uigai)/[^/]*\.env$`,
   String.raw`(^|/)Library/Keychains(/|$)`, String.raw`(^|/)\.netrc$`, String.raw`(^|/)\.npmrc$`, String.raw`(^|/)\.pypirc$`,
   String.raw`(^|/)\.config/gh/hosts\.yml$`, String.raw`(^|/)\.git-credentials$`, String.raw`(^|/)AuthKey_[^/]*\.p8$`,
   String.raw`(^|/)id_(rsa|ed25519|ecdsa|dsa)(\.pub)?$`,
@@ -64,7 +64,7 @@ export function credentialPathReason(path) {
   return CREDENTIAL_PATH_RE.test(s) ? "credential store — never read by tools" : null;
 }
 // A shell command that names a credential path (cat ~/.ssh/id_ed25519, curl -d @$HOME/.tonyai/secret-x.txt …).
-const CREDENTIAL_IN_CMD_RE = /(~|\$HOME|\$\{HOME\}|\/Users\/[^/\s]+|\/home\/[^/\s]+)?\/?(\.ssh\/|\.aws\/|\.gnupg\/|\.private_keys\/|\.tauri\/[^\s]*\.key|\.tonyai\/secret-|\.tonyai\/[^\s]*\.env|Library\/Keychains\/|\.netrc\b|\.git-credentials\b|\.config\/gh\/hosts\.yml|AuthKey_[^\s]*\.p8|id_(rsa|ed25519|ecdsa)\b)/i;
+const CREDENTIAL_IN_CMD_RE = /(~|\$HOME|\$\{HOME\}|\/Users\/[^/\s]+|\/home\/[^/\s]+)?\/?(\.ssh\/|\.aws\/|\.gnupg\/|\.private_keys\/|\.tauri\/[^\s]*\.key|\.(?:tonyai|uigai)\/secret-|\.(?:tonyai|uigai)\/[^\s]*\.env|Library\/Keychains\/|\.netrc\b|\.git-credentials\b|\.config\/gh\/hosts\.yml|AuthKey_[^\s]*\.p8|id_(rsa|ed25519|ecdsa)\b)/i;
 
 // Things that look like secrets in OUTBOUND arguments (URLs, search queries, MCP args).
 const SECRET_TOKEN_RE = /(sk-[A-Za-z0-9_-]{16,}|sk-ant-[A-Za-z0-9_-]{10,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|gho_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}|(?:api[_-]?key|token|secret|password)=[A-Za-z0-9_\-]{16,})/;

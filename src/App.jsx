@@ -49,7 +49,7 @@ const A1111_URL  = "http://127.0.0.1:7860";
 const COMFY_URL  = "http://127.0.0.1:8188";
 // Default workspace where the auto-agent saves project files.
 // Read from localStorage so the user can change it in settings.
-const DEFAULT_WORKSPACE_DIR = "~/TonyAI-Projects";   // "~" is resolved against homeDir at bootstrap
+const DEFAULT_WORKSPACE_DIR = "~/UIG-AI/Projects";   // "~" is resolved against homeDir at bootstrap
 
 const MODES = [
   { id: "auto",   label: "Auto",     icon: "✨" },
@@ -112,7 +112,7 @@ const EXAMPLE_PROMPTS = {
   auto:   ["Summarize this repo for me", "Write an async Python retry helper", "Neon city at 3am, cinematic", "Explain the Move hot potato pattern"],
   chat:   ["Explain quantum entanglement simply", "Best way to learn Rust?", "Write a poem about fog"],
   code:   ["Write a Python web scraper", "Debug this React hook", "Convert to TypeScript"],
-  agent:  ["What's the latest news on Sui blockchain?", "Research the best Rust async runtimes", "What files are in my ~/TonyAI-Projects folder?", "Check which pm2 processes are running"],
+  agent:  ["What's the latest news on Sui blockchain?", "Research the best Rust async runtimes", "What files are in my ~/UIG-AI/Projects folder?", "Check which pm2 processes are running"],
   sui:    ["Write a Move module for a basic NFT with key+store abilities", "Explain PTB hot potato pattern for flash loans", "Show how to share an object vs transfer it"],
   ops:    ["Run a health check on everything monitored", "Deep analysis of the last 6h of alerts", "Which checks are down or unknown right now, and since when?", "Give me today's ops summary"],
   python: ["Async HTTP client with retry + exponential backoff", "Type-annotated dataclass for trade records", "Pytest fixture for mocking Sui RPC responses"],
@@ -242,7 +242,7 @@ ANALYSIS PLAYBOOKS — when asked for one of these, follow its format exactly:
 STANDING RULES:
 - Mutating commands (pm2 restart/stop/delete, deploys, kills, file writes) — propose the exact command, explain why, and wait for approval. Never chain mutations.
 - A slow first response from a service on a free/cold-start tier is not "down"; check twice before alerting.
-- Project-specific rules and context live in the Ops mode memory (~/TonyAI-Projects/memory/ops.md) — follow them.`,
+- Project-specific rules and context live in the Ops mode memory (~/UIG-AI/Projects/memory/ops.md) — follow them.`,
 
   agent: `You are UIG Studios AI Agent — an autonomous assistant with real-time tool access. You can search the web, read files, and run commands to fully answer any question.
 
@@ -297,7 +297,7 @@ EXCEPTION — skip the plan and just act for:
 
 MEMORY UPDATE HABIT:
 When you learn something worth remembering across sessions (a user preference, project constraint, key fact, or correction to a wrong assumption), proactively save it:
-1. read_file ~/TonyAI-Projects/memory/global.md
+1. read_file ~/UIG-AI/Projects/memory/global.md
 2. Append a concise bullet under "## Learned Facts" (create section if missing), ending with an evidence tag saying HOW you know it:
    [ran] you executed it and saw the result · [read: <path or url>] you read it there · [told: user] the user (or a tool/API) said so · [recalled] from your own training
    e.g. "- vitest suite passes 242 tests [ran]"  ·  "- Tony prefers minimal code [told: user]"
@@ -1463,7 +1463,7 @@ const AGENT_TOOLS = [
   { type:"function", function:{ name:"propose_plan",    description:"Present a structured plan to the user for approval BEFORE executing a complex task (2+ files, state-changing commands, architectural choices). The user sees the plan with Approve / Request-changes buttons; the result tells you their decision. Do not start executing until a plan is APPROVED. Skip planning for simple single-step tasks.", parameters:{ type:"object", properties:{ title:{ type:"string", description:"One-line summary of what the plan accomplishes" }, steps:{ type:"array", items:{ type:"string" }, description:"Numbered plan steps, each a concise action ('Create src/api.py with the fetch helper', 'Run pytest and confirm exit 0')" }}, required:["title","steps"] }}},
   { type:"function", function:{ name:"spawn_subagent",  description:"Spawn an isolated subagent to handle a subtask. coder role auto-runs a verifier after writing code, then a fixer if verification fails — you get a guaranteed-working result. researcher=web search only | coder=write+verify+fix (full pipeline) | verifier=run+inspect | fixer=fix broken code.", parameters:{ type:"object", properties:{ role:{ type:"string", enum:["researcher","coder","verifier","fixer"], description:"researcher=web search only | coder=write+verify+fix pipeline | verifier=run+inspect | fixer=fix broken code" }, task:{ type:"string", description:"Complete self-contained task description with all context the subagent needs — it has no access to this conversation" }}, required:["role","task"] }}},
   { type:"function", function:{ name:"search_sessions", description:"Search the user's PAST CONVERSATION transcripts (auto-saved session exports). Use when asked about earlier discussions, prior decisions, 'what did we talk about', or to recall context from previous sessions. Returns matching lines as 'file:line: text' — the filenames start with the session date.", parameters:{ type:"object", properties:{ query:{ type:"string", description:"Keywords or phrase to find in past conversations" }, max_results:{ type:"number", description:"Max matching lines (default 40)" }}, required:["query"] }}},
-  { type:"function", function:{ name:"search_knowledge", description:"Search your personal knowledge base — documents, notes, specs, and files you've added to ~/TonyAI-Documents/. Returns the most relevant passages. Use this to answer questions about your own projects, decisions, preferences, or any documents you've stored.", parameters:{ type:"object", properties:{ query:{ type:"string", description:"What to search for — natural language or keywords" }}, required:["query"] }}},
+  { type:"function", function:{ name:"search_knowledge", description:"Search your personal knowledge base — documents, notes, specs, and files you've added to ~/UIG-AI/Documents/. Returns the most relevant passages. Use this to answer questions about your own projects, decisions, preferences, or any documents you've stored.", parameters:{ type:"object", properties:{ query:{ type:"string", description:"What to search for — natural language or keywords" }}, required:["query"] }}},
   { type:"function", function:{ name:"python_exec",      description:"Execute Python code in a SANDBOXED environment (~/TonyAI-Sandbox/) — safer than run_command for testing snippets, data analysis, or experimentation. Code runs in an isolated venv, not your project tree. Supports optional pip packages. Returns stdout, stderr, and exit code. Prefer this over run_command for any standalone Python code.", parameters:{ type:"object", properties:{ code:{ type:"string", description:"Python code to execute" }, packages:{ type:"string", description:"Optional comma-separated pip packages to install before running (e.g. 'requests,pandas')" }, timeout_seconds:{ type:"number", description:"Max execution time, default 60, max 300" }}, required:["code"] }}},
   { type:"function", function:{ name:"git_status",       description:"Get a git repo's current state: branch, ahead/behind, staged + unstaged + untracked files, stash count. Use BEFORE making changes to understand the current state.", parameters:{ type:"object", properties:{ repo_path:{ type:"string", description:"Absolute path to the git repository" }}, required:["repo_path"] }}},
   { type:"function", function:{ name:"git_diff",         description:"Show git diff for working tree (default) or staged changes. Optionally limit to a single file. Use to review what changed before committing or to understand recent edits.", parameters:{ type:"object", properties:{ repo_path:{ type:"string", description:"Absolute path to the git repository" }, staged:{ type:"boolean", description:"true = show staged diff, false/omit = show working tree diff" }, file:{ type:"string", description:"Optional: limit diff to a specific file path (relative to repo)" }}, required:["repo_path"] }}},
@@ -1788,7 +1788,7 @@ export default function App() {
   const [knowledgeStatus, setKnowledgeStatus] = useState("idle"); // idle | loading | ready | indexing | stale | error
   const [knowledgeMsg,    setKnowledgeMsg]    = useState("");
   const [knowledgeDir,    setKnowledgeDir]    = useState(
-    () => localStorage.getItem("tonyai-knowledge-dir") || "~/TonyAI-Documents"
+    () => localStorage.getItem("tonyai-knowledge-dir") || "~/UIG-AI/Documents"
   );
 
   // Session inline-rename
@@ -1845,7 +1845,7 @@ export default function App() {
   async function startSelfUpdate() {
     setUpdateStatus("Starting…");
     try {
-      setUpdateStatus(await invoke("launch_self_update", { sourceDir: `${homeDir}/tonyai` }));
+      setUpdateStatus(await invoke("launch_self_update", { sourceDir: `${homeDir}/uig-studios-ai` }));
     } catch(e) {
       setUpdateStatus(`⚠ ${e}`);
     }
@@ -2241,7 +2241,7 @@ export default function App() {
     return lines.join("\n");
   }
 
-  // Auto-save session transcript to ~/TonyAI-Exports/
+  // Auto-save session transcript to ~/UIG-AI/Exports/
   // Skips sessions with < 3 messages or already saved at this message count.
   async function autoSaveSession(session) {
     const msgs = session?.messages || [];
@@ -2259,7 +2259,7 @@ export default function App() {
       const slug     = (session.title || "session")
         .slice(0, 40).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
       const filename = `${dateDir}_${timeStr}_${slug}.md`;
-      const path     = `${homeDir}/TonyAI-Exports/${filename}`;
+      const path     = `${homeDir}/UIG-AI/Exports/${filename}`;
       const content  = formatSessionMarkdown(session);
       await invoke("tool_write_file", { path, content });
       // Evidence sidecar (in-toto Statements, evidence-tier predicate) — one per agent turn
@@ -2551,10 +2551,12 @@ export default function App() {
       if (h) {
         setHomeDir(h);
         // Resolve "~"-relative defaults now that the real home is known (no hardcoded user paths).
-        const expand = (p) => (typeof p === "string" && p.startsWith("~") ? h + p.slice(1) : p);
+        // Also remap stored legacy paths (~/TonyAI-<X> → ~/UIG-AI/<X>) — the dirs were moved by migrate_legacy_dirs.
+        const legacy = (p) => String(p).replace(new RegExp(`^${h.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/TonyAI-(Projects|Exports|Documents|Images|Sandbox)`), `${h}/UIG-AI/$1`);
+        const expand = (p) => (typeof p === "string" ? legacy(p.startsWith("~") ? h + p.slice(1) : p) : p);
         setWorkspaceDir(d => expand(d));
         setKnowledgeDir(d => expand(d));
-        setRagSourceDir(d => d || `${h}/TonyAI-Documents`);
+        setRagSourceDir(d => d || `${h}/UIG-AI/Documents`);
       }
     } catch {}
     // Hardware facts → model-fit dots + context clamping
@@ -2599,7 +2601,7 @@ export default function App() {
     try { RV_AVAILABLE = /RV_OK/.test(String(await invoke("tool_run_command", { command: "test -x ~/reversible/rv && echo RV_OK", timeoutSeconds: 5 }))); } catch { RV_AVAILABLE = false; }
 
     // Load persistent memory:
-    //   Priority 1: disk .md files in ~/TonyAI-Projects/memory/ (new, human-readable)
+    //   Priority 1: disk .md files in ~/UIG-AI/Projects/memory/ (new, human-readable)
     //   Priority 2: ~/.tonyai/memory.md JSON blob (old format — used for attachments + migration)
     let baseMemory = { global: { text: "", attachments: [] }, modes: {} };
 
@@ -2742,7 +2744,7 @@ export default function App() {
       memSaveTimer.current = setTimeout(async () => {
         // Keep old format for attachments (binary data can't live in .md)
         try { await invoke("save_memory", { content: JSON.stringify(next) }); } catch {}
-        // Write human-readable .md files to ~/TonyAI-Projects/memory/
+        // Write human-readable .md files to ~/UIG-AI/Projects/memory/
         try {
           await invoke("save_memory_file", {
             name: "global",
@@ -3093,8 +3095,8 @@ export default function App() {
 
         sys += `\n\nFILE WORKSPACES:
 - Code projects:  ${workspaceDir}/<project-name>/
-- Documents/reports: ~/TonyAI-Documents/
-- Exports:        ~/TonyAI-Exports/
+- Documents/reports: ~/UIG-AI/Documents/
+- Exports:        ~/UIG-AI/Exports/
 Use list_dir to check what already exists before creating something new.
 
 TOOLS AVAILABLE FOR THIS TASK (${effectiveMode} mode):
@@ -3112,7 +3114,7 @@ single-file or read-only tasks.
 
 Always complete the task fully. When done, end with TASK_COMPLETE on its own line.
 
-MEMORY: If you learn a user preference, project constraint, correction, or recurring fact during this task — save it: read_file ~/TonyAI-Projects/memory/global.md → append bullet under "## Learned Facts" ending with an evidence tag ([ran] | [read: path/url] | [told: user] | [recalled]) → write_file back (keep the leading --- frontmatter block untouched) → tell user what you saved.`;
+MEMORY: If you learn a user preference, project constraint, correction, or recurring fact during this task — save it: read_file ~/UIG-AI/Projects/memory/global.md → append bullet under "## Learned Facts" ending with an evidence tag ([ran] | [read: path/url] | [told: user] | [recalled]) → write_file back (keep the leading --- frontmatter block untouched) → tell user what you saved.`;
       }
 
       // Code RAG injection (source index)
@@ -3127,7 +3129,7 @@ MEMORY: If you learn a user preference, project constraint, correction, or recur
       }
 
       // General Knowledge Base injection — ALL modes, non-fatal
-      // Auto-injects the most relevant passages from ~/TonyAI-Documents/
+      // Auto-injects the most relevant passages from ~/UIG-AI/Documents/
       if (knowledgeIndex && (knowledgeStatus === "ready" || knowledgeStatus === "stale")) {
         try {
           const qEmbed = await embedQuery(prompt);
@@ -3751,7 +3753,7 @@ After getting results, give your final answer in normal markdown. Never include 
                       });
                     } catch (e) {
                       toolResult = String(e).includes("not found")
-                        ? "No past session transcripts yet — exports appear in ~/TonyAI-Exports as conversations complete."
+                        ? "No past session transcripts yet — exports appear in ~/UIG-AI/Exports as conversations complete."
                         : enrichToolError("search_sessions", e);
                     }
                   }

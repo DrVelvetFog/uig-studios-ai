@@ -1,10 +1,10 @@
 /**
  * UIG Studios AI Ops — config-driven portfolio checks (Phase 1 of the ops console).
  *
- * Config:  ~/.tonyai/ops.json        (seeded from scripts/ops-default.json on first run;
+ * Config:  ~/.uigai/ops.json        (seeded from scripts/ops-default.json on first run;
  *                                     edit freely — read every run; delete to re-seed)
- * State:   ~/.tonyai/ops-state.json  (current status per check — the Ops panel reads this)
- * History: ~/.tonyai/ops-history.jsonl (one snapshot line per run, capped ~2000 lines)
+ * State:   ~/.uigai/ops-state.json  (current status per check — the Ops panel reads this)
+ * History: ~/.uigai/ops-history.jsonl (one snapshot line per run, capped ~2000 lines)
  *
  * Alerting philosophy: findings are raised on status TRANSITIONS only
  * (up→down, down→up), never on every failing tick. Severity per check
@@ -32,7 +32,7 @@ import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
 const HOME           = homedir();
-const TONYAI_DIR     = join(HOME, ".tonyai");
+const TONYAI_DIR     = join(HOME, ".uigai");
 const CONFIG_PATH    = join(TONYAI_DIR, "ops.json");
 const STATE_PATH     = join(TONYAI_DIR, "ops-state.json");
 const HISTORY_PATH   = join(TONYAI_DIR, "ops-history.jsonl");
@@ -346,7 +346,7 @@ function capHistory() {
 
 const BRIEF_PATH = join(TONYAI_DIR, "ops-brief.json");
 const BRIEF_SYSTEM = `You are summarizing the daily status of the services this machine monitors
-(everything defined in ~/.tonyai/ops.json, grouped by project, plus this Mac itself).
+(everything defined in ~/.uigai/ops.json, grouped by project, plus this Mac itself).
 Write like you are texting a friend who runs all of this.
 
 Include exactly:

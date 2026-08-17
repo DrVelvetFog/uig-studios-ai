@@ -3,7 +3,7 @@
  * UIG Studios AI RAG indexer — builds a semantic search index over a source tree.
  * Point SOURCE_DIRS at whatever codebase sui/auto mode should be able to search.
  * Run: node scripts/build-rag-index.mjs
- * Output: ~/.tonyai/rag-index.json
+ * Output: ~/.uigai/rag-index.json
  */
 
 import fs from "fs";
@@ -13,12 +13,12 @@ import os from "os";
 const OLLAMA_URL    = "http://localhost:11434";
 const EMBED_MODEL   = "nomic-embed-text";
 const SOURCE_DIRS   = [
-  `${process.env.HOME}/TonyAI-Documents`,
+  `${process.env.HOME}/UIG-AI/Documents`,
 ];
 const SOURCE_EXTS   = new Set([".ts", ".js", ".rs", ".py", ".move"]);
 const CHUNK_SIZE    = 1200;   // chars per chunk
 const CHUNK_OVERLAP = 200;    // overlap between chunks
-const OUTPUT_PATH   = path.join(os.homedir(), ".tonyai", "rag-index.json");
+const OUTPUT_PATH   = path.join(os.homedir(), ".uigai", "rag-index.json");
 
 // ── Chunker ──────────────────────────────────────────────────────────────────
 function chunkText(text, filename) {

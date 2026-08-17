@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// okf-check — validate ~/TonyAI-Projects/memory as an OKF v0.2 bundle and report
+// okf-check — validate ~/UIG-AI/Projects/memory as an OKF v0.2 bundle and report
 // evidence-tag coverage per file. Usage: node scripts/okf-check.mjs [dir] [--strict]
 // Exit 1 on frontmatter errors (always) or on any warning (--strict).
 import fs from "node:fs";
@@ -8,7 +8,7 @@ import os from "node:os";
 import { validateBundle, TIERS } from "../src/memoryOkf.js";
 
 const args = process.argv.slice(2);
-const dir = args.find(a => !a.startsWith("--")) || path.join(os.homedir(), "TonyAI-Projects", "memory");
+const dir = args.find(a => !a.startsWith("--")) || path.join(os.homedir(), "UIG-AI", "Projects", "memory");
 const strict = args.includes("--strict");
 
 if (!fs.existsSync(dir)) { console.log(`no memory dir at ${dir}`); process.exit(0); }

@@ -1,6 +1,6 @@
 // memoryOkf.js — UIG Studios AI memory files as Open Knowledge Format (OKF v0.2) concepts.
 //
-// Memory lives in ~/TonyAI-Projects/memory/<name>.md, one wiki-page per scope
+// Memory lives in ~/UIG-AI/Projects/memory/<name>.md (legacy ~/TonyAI-Projects/memory/ still recognised), one wiki-page per scope
 // (global + per-mode). This module makes each page an OKF concept document:
 // YAML frontmatter (type/title/generated/status/...) + markdown body, and gives
 // every learned fact an inline evidence tag saying HOW the agent knows it:
@@ -175,9 +175,9 @@ export function validateBundle(files) {
 
 /** Is this path a UIG Studios AI memory file? (write sites use this to decide whether to stamp) */
 export function isMemoryPath(p) {
-  return /(^|\/)TonyAI-Projects\/memory\/[^/]+\.md$/.test(String(p || "").replace(/\\/g, "/"));
+  return /(^|\/)(TonyAI-Projects|UIG-AI\/Projects)\/memory\/[^/]+\.md$/.test(String(p || "").replace(/\\/g, "/"));
 }
 export function memoryNameFromPath(p) {
-  const m = /TonyAI-Projects\/memory\/([^/]+)\.md$/.exec(String(p || "").replace(/\\/g, "/"));
+  const m = /(?:TonyAI-Projects|UIG-AI\/Projects)\/memory\/([^/]+)\.md$/.exec(String(p || "").replace(/\\/g, "/"));
   return m ? m[1] : null;
 }

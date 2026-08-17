@@ -4,13 +4,13 @@
 
 1. Install [Ollama](https://ollama.com/download) and launch it once. The app's empty state shows **Ollama isn't running** until it can reach `localhost:11434`; press **Retry**.
 2. Pull a model. The empty state lists starters sized to your RAM (🟢 comfortable · 🟡 tight · 🔴 will swap). `qwen2.5-coder:7b` is the safe default; `qwen2.5-coder:14b` is the best quality on 16 GB+. Any GGUF model on Hugging Face works too: `ollama pull hf.co/<user>/<repo>` (add `:Q4_K_M` etc. for a quant).
-3. Optional: `ollama pull nomic-embed-text` enables the knowledge-base search (`search_knowledge`) over `~/TonyAI-Documents/`.
+3. Optional: `ollama pull nomic-embed-text` enables the knowledge-base search (`search_knowledge`) over `~/UIG-AI/Documents/`.
 
-The first launch also creates `~/.tonyai/` and an empty memory bundle at `~/TonyAI-Projects/memory/`.
+The first launch also creates `~/.uigai/` and an empty memory bundle at `~/UIG-AI/Projects/memory/`.
 
 ## Keys and cloud models (⚙ settings)
 
-All keys are stored in `~/.tonyai/secret-<name>.txt` with mode 0600 — never in the webview. **Fields save on blur**: type or paste, then click somewhere else before you use the key.
+All keys are stored in `~/.uigai/secret-<name>.txt` with mode 0600 — never in the webview. **Fields save on blur**: type or paste, then click somewhere else before you use the key.
 
 | Setting | What it enables |
 |---|---|
@@ -43,7 +43,7 @@ Traps, in order of how often they bite:
 
 ## Background monitor and Ops mode (optional, macOS)
 
-`scripts/monitor.mjs` runs config-driven checks (HTTP, Sui balances/objects, pm2) every five minutes, writes `~/.tonyai/ops-state.json`, posts transitions to the in-app inbox + macOS notifications, and writes a daily brief. It is **not installed automatically**. To run it under launchd:
+`scripts/monitor.mjs` runs config-driven checks (HTTP, Sui balances/objects, pm2) every five minutes, writes `~/.uigai/ops-state.json`, posts transitions to the in-app inbox + macOS notifications, and writes a daily brief. It is **not installed automatically**. To run it under launchd:
 
 ```bash
 cat > ~/Library/LaunchAgents/com.uigstudios.ai.monitor.plist <<EOF
@@ -51,17 +51,17 @@ cat > ~/Library/LaunchAgents/com.uigstudios.ai.monitor.plist <<EOF
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.uigstudios.ai.monitor</string>
-  <key>ProgramArguments</key><array><string>$(which node)</string><string>$HOME/tonyai/scripts/monitor.mjs</string></array>
+  <key>ProgramArguments</key><array><string>$(which node)</string><string>$HOME/uig-studios-ai/scripts/monitor.mjs</string></array>
   <key>StartInterval</key><integer>300</integer>
   <key>RunAtLoad</key><true/>
-  <key>StandardErrorPath</key><string>$HOME/.tonyai/logs/monitor-error.log</string>
+  <key>StandardErrorPath</key><string>$HOME/.uigai/logs/monitor-error.log</string>
   <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
 </dict></plist>
 EOF
 launchctl load -w ~/Library/LaunchAgents/com.uigstudios.ai.monitor.plist
 ```
 
-Checks live in `~/.tonyai/ops.json` (seeded from `scripts/ops-default.json` — two example checks; replace them). `project` groups cards in the Ops panel; optional `projectOrder` fixes the order. Project-specific rules for the Ops mode go in `~/TonyAI-Projects/memory/ops.md`.
+Checks live in `~/.uigai/ops.json` (seeded from `scripts/ops-default.json` — two example checks; replace them). `project` groups cards in the Ops panel; optional `projectOrder` fixes the order. Project-specific rules for the Ops mode go in `~/UIG-AI/Projects/memory/ops.md`.
 
 ## Shell undo (optional)
 
@@ -71,12 +71,12 @@ Install [rv](https://github.com/DrVelvetFog/reversible) at `~/reversible/rv`. Wh
 
 | Path | What |
 |---|---|
-| `~/.tonyai/secret-*.txt` | keys (0600) |
-| `~/.tonyai/sessions/` · `~/TonyAI-Exports/` | sessions; markdown transcripts + `.evidence.json` sidecars |
-| `~/TonyAI-Projects/memory/` | OKF memory bundle |
-| `~/TonyAI-Documents/` | knowledge base for RAG |
-| `~/TonyAI-Sandbox/` | Python venv for `python_exec` |
-| `~/TonyAI-Images/` | generated images + JSON sidecars |
-| `~/.tonyai/checkpoints/` | per-turn file checkpoints |
-| `~/.tonyai/telemetry.jsonl` | per-run stats (local only) |
-| `~/.tonyai/logs/` | app + monitor logs |
+| `~/.uigai/secret-*.txt` | keys (0600) |
+| `~/.uigai/sessions/` · `~/UIG-AI/Exports/` | sessions; markdown transcripts + `.evidence.json` sidecars |
+| `~/UIG-AI/Projects/memory/` | OKF memory bundle |
+| `~/UIG-AI/Documents/` | knowledge base for RAG |
+| `~/UIG-AI/Sandbox/` | Python venv for `python_exec` |
+| `~/UIG-AI/Images/` | generated images + JSON sidecars |
+| `~/.uigai/checkpoints/` | per-turn file checkpoints |
+| `~/.uigai/telemetry.jsonl` | per-run stats (local only) |
+| `~/.uigai/logs/` | app + monitor logs |

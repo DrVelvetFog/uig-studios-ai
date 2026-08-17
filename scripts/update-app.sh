@@ -1,7 +1,7 @@
 #!/bin/zsh
 # update-app.sh — rebuild UIG Studios AI from source and install to /Applications.
 # Run directly, or via the in-app "Rebuild & update" button (logs to
-# ~/.tonyai/logs/update.log in that case).
+# ~/.uigai/logs/update.log in that case).
 set -e
 cd "$(dirname "$0")/.."
 

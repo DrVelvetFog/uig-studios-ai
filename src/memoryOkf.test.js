@@ -83,9 +83,9 @@ describe("validate", () => {
 
 describe("paths", () => {
   it("recognises memory paths and names", () => {
-    expect(isMemoryPath("/Users/t/TonyAI-Projects/memory/global.md")).toBe(true);
+    expect(isMemoryPath("/Users/t/UIG-AI/Projects/memory/global.md")).toBe(true);
     expect(isMemoryPath("~/TonyAI-Projects/memory/code.md")).toBe(true);
     expect(isMemoryPath("/Users/t/TonyAI-Projects/notes.md")).toBe(false);
-    expect(memoryNameFromPath("C:\\Users\\t\\TonyAI-Projects\\memory\\ops.md")).toBe("ops");
+    expect(memoryNameFromPath("C:\\Users\\t\\UIG-AI\\Projects\\memory\\ops.md")).toBe("ops");
   });
 });
