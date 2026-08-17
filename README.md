@@ -46,6 +46,8 @@ For a signed (and, with credentials, notarized) build see `scripts/release-signe
 
 ## Configuration
 
+Guides: [docs/setup.md](docs/setup.md) (first run, keys, cloud + custom endpoints, MCP servers incl. GitHub, background monitor) · [docs/modes-and-tools.md](docs/modes-and-tools.md) (every mode and tool, subagents, undo, memory).
+
 Everything lives under `~/.tonyai/` and `~/TonyAI-*`:
 
 | Path | What |
