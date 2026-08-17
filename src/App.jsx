@@ -16,6 +16,7 @@ import { DevInspectPanel } from "./components/DevInspectPanel.jsx";
 import { InboxPanel } from "./components/InboxPanel.jsx";
 import { OpsPanel } from "./components/OpsPanel.jsx";
 import { ComparePanel } from "./components/ComparePanel.jsx";
+import { FirstRun } from "./components/FirstRun.jsx";
 import { stampMemory, stripFrontmatter, isMemoryPath, memoryNameFromPath, RESERVED_NAMES } from "./memoryOkf.js";
 import { rvScope, rvWrapCommand, parseRvReport, stripRvReport, rvUndoCommand } from "./rv.js";
 import { evidenceSummary, evidenceLine, completionTier, buildTurnStatement } from "./evidence.js";
@@ -107,10 +108,10 @@ const MODEL_TIERS = {
 };
 
 const EXAMPLE_PROMPTS = {
-  auto:   ["Why is my flash loan failing?", "Write an async Python retry helper", "Neon city at 3am, cinematic", "Explain the Move hot potato pattern"],
+  auto:   ["Summarize this repo for me", "Write an async Python retry helper", "Neon city at 3am, cinematic", "Explain the Move hot potato pattern"],
   chat:   ["Explain quantum entanglement simply", "Best way to learn Rust?", "Write a poem about fog"],
   code:   ["Write a Python web scraper", "Debug this React hook", "Convert to TypeScript"],
-  agent:  ["What's the latest news on Sui blockchain?", "Research the best Rust async runtimes", "What files are in my tonyai/src folder?", "Check which pm2 processes are running"],
+  agent:  ["What's the latest news on Sui blockchain?", "Research the best Rust async runtimes", "What files are in my ~/TonyAI-Projects folder?", "Check which pm2 processes are running"],
   sui:    ["Write a Move module for a basic NFT with key+store abilities", "Explain PTB hot potato pattern for flash loans", "Show how to share an object vs transfer it"],
   ops:    ["Run a health check on everything monitored", "Deep analysis of the last 6h of alerts", "Which checks are down or unknown right now, and since when?", "Give me today's ops summary"],
   python: ["Async HTTP client with retry + exponential backoff", "Type-annotated dataclass for trade records", "Pytest fixture for mocking Sui RPC responses"],
@@ -2583,8 +2584,16 @@ export default function App() {
 
     // Step 2 — load disk .md files (text only — overrides old format text)
     try {
-      const filesRaw = await invoke("read_memory_files");
-      const files = JSON.parse(filesRaw || "{}");
+      let filesRaw = await invoke("read_memory_files");
+      let files = JSON.parse(filesRaw || "{}");
+      if (Object.keys(files).length === 0) {
+        // Fresh install: create an empty OKF memory bundle so the memory habit has a file to append to.
+        try {
+          await invoke("save_memory_file", { name: "index", content: `---\nokf_version: "0.2"\n---\n# Memory\n\nPersistent memory, one concept per scope. Global is injected into every mode; a mode file only for that mode. Facts end with an evidence tag ([ran] [read: …] [told: …] [recalled]).\n\n## Scopes\n\n- [Global](global.md)\n` });
+          await invoke("save_memory_file", { name: "global", content: stampMemory("# Global memory\n\n## About the user\n\n## Learned Facts\n", { name: "global", by: "process:first-run" }) });
+          filesRaw = await invoke("read_memory_files"); files = JSON.parse(filesRaw || "{}");
+        } catch {}
+      }
       if (Object.keys(files).length > 0) {
         // Disk files exist — use their text, keep attachments from old format
         const modes = { ...baseMemory.modes };
@@ -4764,7 +4773,7 @@ After getting results, give your final answer in normal markdown. Never include 
           {messages.length===0 ? (
             <div className="empty-state">
               {/* Icon mark — "T" in purple gradient per design spec */}
-              <div style={{ width:50, height:50, borderRadius:13, display:"flex", alignItems:"center", justifyContent:"center", marginBottom:2, fontSize:20, fontWeight:700, color:isDark?"rgba(200,185,255,0.85)":"white", background:isDark?"linear-gradient(145deg, #3a2870 0%, #221855 100%)":"linear-gradient(145deg, #7c5cbf 0%, #4e35a0 100%)", boxShadow:isDark?"0 4px 16px rgba(40,20,100,0.5), 0 1px 0 rgba(180,160,255,0.10) inset":"0 4px 14px rgba(80,50,160,0.35), 0 1px 0 rgba(255,255,255,0.15) inset", border:isDark?"0.5px solid rgba(160,130,255,0.20)":"none" }}>T</div>
+              <div style={{ width:50, height:50, borderRadius:13, display:"flex", alignItems:"center", justifyContent:"center", marginBottom:2, fontSize:20, fontWeight:700, color:isDark?"rgba(200,185,255,0.85)":"white", background:isDark?"linear-gradient(145deg, #3a2870 0%, #221855 100%)":"linear-gradient(145deg, #7c5cbf 0%, #4e35a0 100%)", boxShadow:isDark?"0 4px 16px rgba(40,20,100,0.5), 0 1px 0 rgba(180,160,255,0.10) inset":"0 4px 14px rgba(80,50,160,0.35), 0 1px 0 rgba(255,255,255,0.15) inset", border:isDark?"0.5px solid rgba(160,130,255,0.20)":"none" }}>U</div>
               {/* Heading — always "What can I help with?" per spec */}
               <h1>What can I help with?</h1>
               {/* Subtitle — model name + routing status */}
@@ -4773,15 +4782,20 @@ After getting results, give your final answer in normal markdown. Never include 
                   ? IMAGE_BACKENDS.find(b=>b.id===imgSettings.backend)?.label || "image"
                   : `${(displayModel||model||"…").split(":")[0]} · ${smartRoute?"smart routing":"manual"}`}
               </div>
-              {/* Chips — generic per spec, plus mode-specific if available */}
+              {/* First run: no Ollama, or no models yet → setup card instead of example chips */}
+              {(ollamaOk === false || (ollamaOk && models.length === 0)) && mode !== "image" ? (
+                <FirstRun ollamaOk={ollamaOk} models={models} ramBytes={ramBytes} pullingModel={pullingModel} pullStatus={pullStatus}
+                          onPull={pullModel} onRetry={bootstrap} isDark={isDark} />
+              ) : (
               <div style={{ display:"flex", flexWrap:"wrap", gap:7, justifyContent:"center", maxWidth:480 }}>
                 {(EXAMPLE_PROMPTS[mode]?.length
                   ? EXAMPLE_PROMPTS[mode]
-                  : ["Sui contract","Debug Python","Draft a post","Generate image"]
+                  : ["Explain a concept","Debug some code","Draft a message","Generate an image"]
                 ).map((p,i)=>(
                   <button key={i} className="example-chip" onClick={()=>setInput(p)}>{p}</button>
                 ))}
               </div>
+              )}
             </div>
           ) : null}
 
@@ -4794,7 +4808,7 @@ After getting results, give your final answer in normal markdown. Never include 
                   <div key={i} className={`msg-wrap ${isUser?"user-msg":"ai-msg"}`}>
                     {/* AI avatar — only for non-user */}
                     {!isUser && (
-                      <div className="ai-avatar">T</div>
+                      <div className="ai-avatar">U</div>
                     )}
 
                     {/* Message body */}
