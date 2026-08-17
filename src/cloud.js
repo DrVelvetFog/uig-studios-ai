@@ -1,5 +1,5 @@
 // ── Cloud model routing + wire-format conversion ─────────────────────────────
-// Pure module. TonyAI speaks Ollama's chat format internally; OpenRouter and
+// Pure module. UIG Studios AI speaks Ollama's chat format internally; OpenRouter and
 // OpenAI both speak OpenAI Chat Completions. This module owns the mapping.
 //
 // Cloud model ids are prefixed so routing is a string check:
@@ -32,7 +32,7 @@ export function cloudDisplayName(m) {
 // Differences handled:
 //  - assistant tool_calls: arguments must be a JSON *string*, each call needs
 //    an id, and the following role:"tool" results must reference those ids.
-//    Ollama's native tool calls often have no id and TonyAI's generated result
+//    Ollama's native tool calls often have no id and UIG Studios AI's generated result
 //    ids don't always match — so ids are (re)assigned here and the tool results
 //    that follow each assistant turn are re-linked positionally.
 //  - tool messages: OpenAI shape is {role:"tool", tool_call_id, content} (no name).

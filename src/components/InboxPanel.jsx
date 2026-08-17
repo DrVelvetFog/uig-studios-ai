@@ -64,7 +64,7 @@ export function InboxPanel({ inbox, onMarkRead, onMarkAllRead, onAsk, onClose, i
                   <div style={{ display:"flex", flexDirection:"column", gap:4, flexShrink:0 }}>
                     <button onClick={() => onAsk(f)}
                       style={{ background:"var(--tny-accent-lo)", border:"1px solid var(--tny-line2)", color:"var(--tny-tx3)", cursor:"pointer", borderRadius:6, padding:"3px 9px", fontSize:10, fontFamily:"inherit", whiteSpace:"nowrap" }}>
-                      Ask TonyAI
+                      Ask UIG Studios AI
                     </button>
                     {!f.read && (
                       <button onClick={() => onMarkRead(f.id)}

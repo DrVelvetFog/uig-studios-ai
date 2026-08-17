@@ -5,7 +5,7 @@
 // command still flows through the normal agent approval path.
 
 const STATUS_COLOR = { up: "#22c068", down: "#ef4444", unknown: "#f97316" };
-const PROJECT_ORDER = ["PoR", "FairLine", "Hole in Town", "Bots"];
+// Card group order: ops.json may set "projectOrder"; otherwise groups appear in first-seen order.
 
 function age(ts) {
   if (!ts) return "";
@@ -40,6 +40,7 @@ export function OpsPanel({ opsState, onAsk, onRefresh, onClose }) {
   const checks = Object.entries(opsState?.checks || {}).map(([id, v]) => ({ id, ...v }));
   const byProject = {};
   checks.forEach(c => { (byProject[c.project || "Other"] ||= []).push(c); });
+  const PROJECT_ORDER = Array.isArray(opsState?.projectOrder) ? opsState.projectOrder : [];
   const projects = Object.keys(byProject).sort((a, b) => {
     const ia = PROJECT_ORDER.indexOf(a), ib = PROJECT_ORDER.indexOf(b);
     return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib) || a.localeCompare(b);

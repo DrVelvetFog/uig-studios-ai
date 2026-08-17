@@ -47,7 +47,7 @@ const A1111_URL  = "http://127.0.0.1:7860";
 const COMFY_URL  = "http://127.0.0.1:8188";
 // Default workspace where the auto-agent saves project files.
 // Read from localStorage so the user can change it in settings.
-const DEFAULT_WORKSPACE_DIR = "/Users/tonyjagodka/TonyAI-Projects";
+const DEFAULT_WORKSPACE_DIR = "~/TonyAI-Projects";   // "~" is resolved against homeDir at bootstrap
 
 const MODES = [
   { id: "auto",   label: "Auto",     icon: "✨" },
@@ -112,7 +112,7 @@ const EXAMPLE_PROMPTS = {
   code:   ["Write a Python web scraper", "Debug this React hook", "Convert to TypeScript"],
   agent:  ["What's the latest news on Sui blockchain?", "Research the best Rust async runtimes", "What files are in my tonyai/src folder?", "Check which pm2 processes are running"],
   sui:    ["Write a Move module for a basic NFT with key+store abilities", "Explain PTB hot potato pattern for flash loans", "Show how to share an object vs transfer it"],
-  ops:    ["Run a health check on the portfolio", "Deep analysis of the last 6h of alerts", "Why is the FairLine dashboard down?", "Give me today's ops summary"],
+  ops:    ["Run a health check on everything monitored", "Deep analysis of the last 6h of alerts", "Which checks are down or unknown right now, and since when?", "Give me today's ops summary"],
   python: ["Async HTTP client with retry + exponential backoff", "Type-annotated dataclass for trade records", "Pytest fixture for mocking Sui RPC responses"],
   image:  ["Neon city at 3am, rain-slicked streets, cinematic", "Fox reading in a candlelit library, oil painting", "Abstract crystalline mountain, sunrise, 8k"],
 };
@@ -219,51 +219,30 @@ module pkg::my_module {
 \`\`\`
 Always produce compilable Move code with explicit type annotations.
 
-DEX / DEFI INTEGRATION — hard-won gotchas, each one cost a debugging session:
-- BLUEFIN_MIN_SQRT = 4295048017n (NOT 4295048016 — off-by-one causes MoveAbort 1009)
-- Turbos swap_a_b_with_return_ → (Coin<B> output, Coin<A> leftover) — output is the FIRST result
-- Cetus SUI/USDC: coinA=USDC, coinB=SUI (REVERSED vs pair order) → a2b=true means USDC→SUI.
-  Always check a Cetus pool's coin ordering; do not assume it matches the pair name.
-- Bluefin SUI/USDC: Pool<SUI,USDC>, same as pair order → no type-arg override needed
-- Q64.64 sqrt price: use BigInt(sqrtPrice) >> 32n before converting to float
-- Bluefin package 0xd075338d105482f1527cbfd363d6413558f184dec36d9138a70261e87f486e9c (gateway::route_swap)
-- Cetus package 0xb2db7142fa83210a7d78d9c12ac49c043b3cbbd482224fea6e3da00aa5a5ae2d
-
-NAVI FLASH LOANS (call the Move functions directly — the SDK costs ~3200ms of HTTP per invocation):
-- NAVI_PKG 0x81c408448d0d57b3e371ea94de1d40bf852784d3e225de1e74acab3e8395c18f
-- NAVI_FLASHLOAN_CONFIG 0x3672b2bf471a60c30a03325f104f92fb195c9d337ba58072dce764fe2aa5e2dc
-- NAVI_STORAGE 0xbb4e2f4b6205c2e2a2db47aeb4f830796ec7c005f88537ee775986639bc442fe
-- v2 mainnet: flash_loan_with_ctx_v2(flashloanConfig, pool, amount:u64, 0x05) → [Balance<T>, Receipt]
-- repay: flash_repay_with_ctx(0x06:clock, storage, pool, receipt, repayBalance)
-- Borrow returns Balance<T>, not Coin<T> — balanceToCoin before any DEX swap, coinToBalance before repaying
-- Fee is 0%. The whole TX reverts if the repay is short, so a failed loan risks gas only.
-- Verify the on-chain protocol version before trusting these signatures; NAVI has shipped breaking v1→v2 changes.
-
 CODING DISCIPLINE: Think before writing — state your interpretation first, ask if unclear. Minimum code only. Touch only what was asked — don't reformat adjacent modules or fix unrelated issues silently. Confirm what "done" means before starting.`,
 
-  ops: `You are TonyAI Ops — the operations console for Tony's project portfolio: PoR (proof-of-personhood, live on Sui testnet), FairLine (DeepBook vault, local pm2), Hole in Town (web game on Netlify), the sui-x402 facilitator, and this Mac itself.
+  ops: `You are UIG Studios AI Ops — the operations console for the services and projects configured in ~/.tonyai/ops.json (the background monitor checks them every 5 minutes) and for this machine itself.
 
 DATA SOURCES — read these with tools, never guess numbers:
-- ~/.tonyai/ops-state.json — current status of every portfolio check (background monitor writes it every 5 min)
+- ~/.tonyai/ops-state.json — current status of every check (the monitor writes it every 5 min)
 - ~/.tonyai/ops-history.jsonl — one snapshot per monitor run (statuses + metrics) for trends
-- ~/.tonyai/ops.json — what is monitored and how (check definitions)
+- ~/.tonyai/ops.json — what is monitored and how (check definitions, grouped by project)
 - ~/.tonyai/inbox.json — monitor findings and alerts
-- pm2 (run_command "pm2 jlist") for local processes.
+- pm2 (run_command "pm2 jlist") for local processes, when pm2 is installed.
 
-Before any time-window query against a data file, verify the timestamp column's units with a quick SELECT — don't assume.
+Before any time-window query against a data file, verify the timestamp column's units with a quick look — don't assume.
 
 ANALYSIS PLAYBOOKS — when asked for one of these, follow its format exactly:
-1. HEALTH CHECK (last ~30 min of data): answer only — (a) is anything wrong that needs attention? (yes/no + why); (b) the single most important thing right now; (c) action needed? (yes/no + what). Under 100 words, plain English.
-2. DEEP ANALYSIS (last ~6 h): respond as — ROOT CAUSE: [one sentence] / BEST OPPORTUNITY: [pair + route] / RECOMMENDED CHANGE: [env key = value, reason] / BUG DETECTED: [yes/no — if yes, describe]. Be specific, use the actual data.
-3. DAILY SUMMARY (last 24 h): one-word health status (Excellent/Good/Warning/Critical); best thing that happened; biggest problem; one specific thing to do tomorrow; estimated profit if all opportunities had executed. Under 120 words, written like texting a friend who runs this portfolio.
+1. HEALTH CHECK (last ~30 min of data): answer only — (a) is anything wrong that needs attention? (yes/no + why); (b) the single most important thing right now; (c) action needed? (yes/no + what). Under 120 words.
+2. DEEP ANALYSIS (last ~6 h): ROOT CAUSE: [one sentence] / TREND: [what changed and since when] / RECOMMENDED CHANGE: [config key = value, or the exact command, with reason] / BUG DETECTED: [yes/no — if yes, describe]
+3. DAILY SUMMARY (last 24 h): one-word health status (Excellent/Good/Warning/Critical); best thing that happened; biggest problem; one specific thing to do tomorrow.
 
 STANDING RULES:
 - Mutating commands (pm2 restart/stop/delete, deploys, kills, file writes) — propose the exact command, explain why, and wait for approval. Never chain mutations.
-- navi-liq must STAY OFF until a flat-fee RPC plan exists — a past accidental run cost $400 in metered RPC overage. If you ever see it running, that IS the most important finding.
-- The PoR attestor is on Render's free tier: it cold-starts (~40s) if keep-alive pings stop. Slow first response ≠ down.
-- FairLine cron processes show "stopped" between runs — that is normal, only "errored" or missing is a problem.`,
+- A slow first response from a service on a free/cold-start tier is not "down"; check twice before alerting.
+- Project-specific rules and context live in the Ops mode memory (~/TonyAI-Projects/memory/ops.md) — follow them.`,
 
-  agent: `You are TonyAI Agent — an autonomous assistant with real-time tool access. You can search the web, read files, and run commands to fully answer any question.
+  agent: `You are UIG Studios AI Agent — an autonomous assistant with real-time tool access. You can search the web, read files, and run commands to fully answer any question.
 
 AVAILABLE TOOLS:
 - web_search(query): Search the internet for current information, news, docs, prices, research
@@ -853,7 +832,7 @@ function persistSessions(sessions) {
         if (lastWrittenJson.get(s.id) === json) continue;
         await invoke("save_session", { id: String(s.id), data: json });
         lastWrittenJson.set(s.id, json);
-      } catch (e) { console.warn("[TonyAI] session save failed:", e); }
+      } catch (e) { console.warn("[UIG Studios AI] session save failed:", e); }
     }
   }, 800);
 }
@@ -1311,12 +1290,12 @@ async function runSubagent({ role, task, model, signal, braveApiKey, onProgress,
             else if (fnName === "search_files") toolResult = await invoke("tool_search_files", { dir: fnArgs.dir, pattern: fnArgs.pattern, extensions: fnArgs.extensions ?? null, maxResults: fnArgs.max_results ?? null });
             else if (fnName === "run_command") {
               const scope = RV_AVAILABLE && checkpoint ? rvScope(fnArgs.command, checkpoint.lastToolDir) : null;
-              const raw = await invoke("tool_run_command", { command: scope ? rvWrapCommand(fnArgs.command, scope, { actor: `tonyai/${model || "agent"}` }) : fnArgs.command, timeoutSeconds: null });
+              const raw = await invoke("tool_run_command", { command: scope ? rvWrapCommand(fnArgs.command, scope, { actor: `uig-studios-ai/${model || "agent"}` }) : fnArgs.command, timeoutSeconds: null });
               const rep = scope ? parseRvReport(raw) : null;
               if (rep) { checkpoint.rvActions.push({ ...rep, command: fnArgs.command }); if (scope) checkpoint.lastToolDir = scope; toolResult = stripRvReport(raw); step.rv = rep; }
               else toolResult = raw;
             }
-            else if (fnName === "write_file")   toolResult = await invoke("tool_write_file",   { path: fnArgs.path, content: isMemoryPath(fnArgs.path) ? stampMemory(fnArgs.content, { name: memoryNameFromPath(fnArgs.path), by: `tonyai/${model || "agent"}` }) : fnArgs.content });
+            else if (fnName === "write_file")   toolResult = await invoke("tool_write_file",   { path: fnArgs.path, content: isMemoryPath(fnArgs.path) ? stampMemory(fnArgs.content, { name: memoryNameFromPath(fnArgs.path), by: `uig-studios-ai/${model || "agent"}` }) : fnArgs.content });
             else if (fnName === "edit_file")    toolResult = await invoke("tool_edit_file",    { path: fnArgs.path, oldString: fnArgs.old_string, newString: fnArgs.new_string, replaceAll: fnArgs.replace_all ?? null });
             else toolResult = `Unknown tool: ${fnName}`;
             step.status = "done";
@@ -1807,7 +1786,7 @@ export default function App() {
   const [knowledgeStatus, setKnowledgeStatus] = useState("idle"); // idle | loading | ready | indexing | stale | error
   const [knowledgeMsg,    setKnowledgeMsg]    = useState("");
   const [knowledgeDir,    setKnowledgeDir]    = useState(
-    () => localStorage.getItem("tonyai-knowledge-dir") || `${DEFAULT_WORKSPACE_DIR.split("/TonyAI-Projects")[0]}/TonyAI-Documents`
+    () => localStorage.getItem("tonyai-knowledge-dir") || "~/TonyAI-Documents"
   );
 
   // Session inline-rename
@@ -1870,7 +1849,7 @@ export default function App() {
     try { return JSON.parse(localStorage.getItem("tonyai-approval-allowlist") || "[]"); } catch { return []; }
   });
   useEffect(() => { localStorage.setItem("tonyai-approval-allowlist", JSON.stringify(approvalAllowlist)); }, [approvalAllowlist]);
-  const [homeDir, setHomeDir] = useState("/Users/tonyjagodka"); // populated from Rust at bootstrap
+  const [homeDir, setHomeDir] = useState(""); // populated from Rust at bootstrap
   const [ramBytes, setRamBytes] = useState(0); // total RAM — for model-fit estimation
   // MCP server configurations (persisted to localStorage)
   // Guards the mcpServers persist effect until legacy plaintext tokens are safely in
@@ -1882,7 +1861,7 @@ export default function App() {
   // Discovered tools from running MCP servers: { [serverId]: McpTool[] }
   const [mcpDiscoveredTools, setMcpDiscoveredTools] = useState({});
   const [showMcpPanel, setShowMcpPanel] = useState(false);
-  const [ragSourceDir, setRagSourceDir] = useState(() => localStorage.getItem("tonyai-rag-dir") || "/Users/tonyjagodka/tonyai/src");
+  const [ragSourceDir, setRagSourceDir] = useState(() => localStorage.getItem("tonyai-rag-dir") || ""); // default: <homeDir>/TonyAI-Documents once homeDir is known
   const [editingRagDir, setEditingRagDir] = useState(false);
   const [workspaceDir, setWorkspaceDir] = useState(() => localStorage.getItem("tonyai-workspace-dir") || DEFAULT_WORKSPACE_DIR);
   const [editingWorkspaceDir, setEditingWorkspaceDir] = useState(false);
@@ -2189,7 +2168,7 @@ export default function App() {
         // Show routing badge and tool steps summary
         const routeNote = msg.routedMode && msg.routedMode !== session.mode
           ? ` *(routed → ${msg.routedMode})*` : "";
-        lines.push(`**TonyAI${routeNote}:**\n`);
+        lines.push(`**UIG Studios AI${routeNote}:**\n`);
         for (const s of (msg.toolSteps || [])) {
           const icon = TOOL_ICONS[s.name] || "🔧";
           const status = s.status === "error" ? "❌" : "✅";
@@ -2216,11 +2195,11 @@ export default function App() {
         continue;
       }
       // Regular assistant message
-      lines.push(`**TonyAI:** ${msg.content || ""}\n`);
+      lines.push(`**UIG Studios AI:** ${msg.content || ""}\n`);
     }
 
     lines.push("---");
-    lines.push(`*Auto-saved by TonyAI · ${new Date().toLocaleString()}*`);
+    lines.push(`*Auto-saved by UIG Studios AI · ${new Date().toLocaleString()}*`);
     return lines.join("\n");
   }
 
@@ -2252,7 +2231,7 @@ export default function App() {
       }
       savedSessionMap.current[key] = msgs.length;
     } catch (e) {
-      console.warn("[TonyAI] Auto-save failed:", e);
+      console.warn("[UIG Studios AI] Auto-save failed:", e);
     }
   }
 
@@ -2267,7 +2246,7 @@ export default function App() {
         lines.push(`---\n**[Image generated]** ${msg.prompt}\n`);
         continue;
       }
-      lines.push(`---\n**${msg.role === "user" ? "You" : "TonyAI"}**\n`);
+      lines.push(`---\n**${msg.role === "user" ? "You" : "UIG Studios AI"}**\n`);
       lines.push((msg.content || "") + "\n");
     }
     const md = lines.join("\n");
@@ -2529,7 +2508,17 @@ export default function App() {
 
   async function bootstrap() {
     // Fetch home directory from Rust (avoids hardcoded usernames)
-    try { const h = await invoke("get_home_dir"); if (h) setHomeDir(h); } catch {}
+    try {
+      const h = await invoke("get_home_dir");
+      if (h) {
+        setHomeDir(h);
+        // Resolve "~"-relative defaults now that the real home is known (no hardcoded user paths).
+        const expand = (p) => (typeof p === "string" && p.startsWith("~") ? h + p.slice(1) : p);
+        setWorkspaceDir(d => expand(d));
+        setKnowledgeDir(d => expand(d));
+        setRagSourceDir(d => d || `${h}/TonyAI-Documents`);
+      }
+    } catch {}
     // Hardware facts → model-fit dots + context clamping
     try {
       const hw = JSON.parse(await invoke("get_hardware_info"));
@@ -2556,7 +2545,7 @@ export default function App() {
         persistActive(target);
       }
       localStorage.removeItem(SESSION_KEY); // sessions live on disk now — free the quota
-    } catch (e) { console.warn("[TonyAI] session hydration failed:", e); }
+    } catch (e) { console.warn("[UIG Studios AI] session hydration failed:", e); }
 
     // Start any enabled MCP servers
     const enabledServers = mcpServers.filter(s =>
@@ -3077,7 +3066,7 @@ Always complete the task fully. When done, end with TASK_COMPLETE on its own lin
 MEMORY: If you learn a user preference, project constraint, correction, or recurring fact during this task — save it: read_file ~/TonyAI-Projects/memory/global.md → append bullet under "## Learned Facts" ending with an evidence tag ([ran] | [read: path/url] | [told: user] | [recalled]) → write_file back (keep the leading --- frontmatter block untouched) → tell user what you saved.`;
       }
 
-      // Arb bot RAG injection
+      // Code RAG injection (source index)
       if (effectiveMode === "sui" && ragIndex && ragStatus === "ready") {
         try {
           const qEmbed = await embedQuery(prompt);
@@ -3560,7 +3549,7 @@ After getting results, give your final answer in normal markdown. Never include 
                   else if (fnName === "search_files") toolResult = await invoke("tool_search_files", { dir: fnArgs.dir, pattern: fnArgs.pattern, extensions: fnArgs.extensions ?? null, maxResults: fnArgs.max_results ?? null });
                   else if (fnName === "run_command") {
                     const scope = RV_AVAILABLE ? rvScope(fnArgs.command, turnCheckpoint.lastToolDir) : null;
-                    const raw = await invoke("tool_run_command", { command: scope ? rvWrapCommand(fnArgs.command, scope, { actor: `tonyai/${model || "agent"}` }) : fnArgs.command, timeoutSeconds: fnArgs.timeout_seconds ?? null });
+                    const raw = await invoke("tool_run_command", { command: scope ? rvWrapCommand(fnArgs.command, scope, { actor: `uig-studios-ai/${model || "agent"}` }) : fnArgs.command, timeoutSeconds: fnArgs.timeout_seconds ?? null });
                     const rep = scope ? parseRvReport(raw) : null;
                     if (rep) { turnCheckpoint.rvActions.push({ ...rep, command: fnArgs.command }); if (scope) turnCheckpoint.lastToolDir = scope; toolResult = stripRvReport(raw); stepRv = rep; }
                     else toolResult = raw;
@@ -3581,7 +3570,7 @@ After getting results, give your final answer in normal markdown. Never include 
                       turnCheckpoint.mutatedPaths.add(fnArgs.path);
                     } catch {}
                     toolResult = fnName === "write_file"
-                      ? await invoke("tool_write_file", { path: fnArgs.path, content: isMemoryPath(fnArgs.path) ? stampMemory(fnArgs.content, { name: memoryNameFromPath(fnArgs.path), by: `tonyai/${model || "agent"}` }) : fnArgs.content })
+                      ? await invoke("tool_write_file", { path: fnArgs.path, content: isMemoryPath(fnArgs.path) ? stampMemory(fnArgs.content, { name: memoryNameFromPath(fnArgs.path), by: `uig-studios-ai/${model || "agent"}` }) : fnArgs.content })
                       : await invoke("tool_edit_file",  { path: fnArgs.path, oldString: fnArgs.old_string, newString: fnArgs.new_string, replaceAll: fnArgs.replace_all ?? null });
                     // Verify nudge — appended for runnable code files so the model is
                     // forced to run and check [exit 0] before declaring completion.
@@ -3938,7 +3927,7 @@ After getting results, give your final answer in normal markdown. Never include 
           num_ctx: effectiveNumCtx,
         },
       };
-      console.log("[TonyAI] sending to Ollama, model:", activeModel, smartRoute && activeModel !== model ? `(smart-routed from ${model})` : "", "msgs:", reqBody.messages.length);
+      console.log("[UIG Studios AI] sending to Ollama, model:", activeModel, smartRoute && activeModel !== model ? `(smart-routed from ${model})` : "", "msgs:", reqBody.messages.length);
 
       const eventId = Date.now().toString();
       if (streamRef.current[sessId]) streamRef.current[sessId].eventId = eventId;
@@ -4061,7 +4050,7 @@ After getting results, give your final answer in normal markdown. Never include 
                   <path d="M8 12.2 Q10 14 12 12.2" stroke="white" strokeWidth="1.1" fill="none" strokeLinecap="round"/>
                 </svg>
               </div>
-              <span style={{ fontSize:15, fontWeight:600, letterSpacing:"-0.3px", fontFamily:"'Syne',sans-serif", flex:1, background:isDark?"linear-gradient(135deg, #c4b0ff 0%, #a78bfa 100%)":"linear-gradient(135deg, #4a3480 0%, #6b4fbf 100%)", WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent", backgroundClip:"text" }}>TonyAI</span>
+              <span style={{ fontSize:15, fontWeight:600, letterSpacing:"-0.3px", fontFamily:"'Syne',sans-serif", flex:1, background:isDark?"linear-gradient(135deg, #c4b0ff 0%, #a78bfa 100%)":"linear-gradient(135deg, #4a3480 0%, #6b4fbf 100%)", WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent", backgroundClip:"text" }}>UIG Studios AI</span>
               <div style={{ width:7, height:7, borderRadius:"50%", background:ollamaOk?"radial-gradient(circle at 35% 35%, #6ee77a, #28b53a)":"#ef4444", boxShadow:ollamaOk?"0 0 5px rgba(40,181,58,0.4)":"none", flexShrink:0 }} title={ollamaOk?"Online":"Offline"}/>
             </div>
             <button onClick={newSession} style={{ width:"100%", padding:"6px 8px", borderRadius:7, border:"none", background:"transparent", color:"var(--tny-accent)", fontSize:13, cursor:"pointer", fontFamily:"inherit", textAlign:"left", display:"flex", alignItems:"center", gap:7, transition:"background 0.12s" }}
@@ -4943,7 +4932,7 @@ After getting results, give your final answer in normal markdown. Never include 
             <span style={{ fontSize:10, color:"var(--tny-tx5)", textTransform:"uppercase", letterSpacing:"0.06em", flexShrink:0 }}>🔄 Background</span>
             {orphanProcs.map(o => (
               <div key={o.id} style={{ display:"flex", alignItems:"center", gap:6, background:"var(--tny-code)", border:"1px solid rgba(234,179,8,0.4)", borderRadius:6, padding:"2px 8px", fontSize:10.5, fontFamily:"'JetBrains Mono',monospace" }}
-                title={`Still running from a previous TonyAI session (pid ${o.pid})`}>
+                title={`Still running from a previous UIG Studios AI session (pid ${o.pid})`}>
                 <span style={{ width:6, height:6, borderRadius:"50%", background:"#eab308", flexShrink:0 }}/>
                 <span style={{ color:"#eab308", flexShrink:0 }}>orphan</span>
                 <span style={{ color:"var(--tny-tx3)", maxWidth:220, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{o.command}</span>

@@ -1,4 +1,4 @@
-// evidence.js — evidence tiers for TonyAI agent turns (https://github.com/DrVelvetFog/evidence-tier)
+// evidence.js — evidence tiers for UIG Studios AI agent turns (https://github.com/DrVelvetFog/evidence-tier)
 //
 // Every tool step gets a tier by WHAT KIND OF TOOL IT IS — stamped by code, never
 // by the model (ev R7: never infer `ran` from prose):
@@ -116,7 +116,7 @@ export async function buildTurnStatement({ turnId, model, mode, finalText, steps
     subject: [{ name: `turn:${turnId}`, digest: subjectDigest }],
     predicateType: PREDICATE_TYPE,
     predicate: {
-      producer: { kind: "agent", tool: "tonyai", model, mode, session: turnId },
+      producer: { kind: "agent", tool: "uig-studios-ai", model, mode, session: turnId },
       claims: [{
         id: "final", text: String(finalText || "").replace(/\s+/g, " ").slice(0, 200),
         tier, evidence: tier === "recalled" ? [] : evidence.filter(e => (tier === "ran" ? e.kind === "action" : tier === "read" ? e.kind !== "party" : true)),

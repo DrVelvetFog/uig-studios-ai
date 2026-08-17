@@ -1,7 +1,7 @@
 // rv.js — journal shell-command effects with rv (https://github.com/DrVelvetFog/reversible)
 // so "Undo command effects" exists alongside the file checkpoint's "Revert".
 //
-// TonyAI's checkpoint snapshots only write_file/edit_file. run_command is one-way.
+// UIG Studios AI's checkpoint snapshots only write_file/edit_file. run_command is one-way.
 // rv snapshots the git worktree before/after a command and can restore per path.
 // We derive the scope (a git repo) from the command itself (leading `cd <dir>`) or
 // the last directory a tool touched this turn; with no scope, the command runs raw.

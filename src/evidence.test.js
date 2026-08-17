@@ -48,7 +48,7 @@ describe("statement", () => {
     expect(c.evidence.every(e => e.kind === "action")).toBe(true);
     expect(c.evidence.map(e => e.ref)).toEqual(["rv:/p#9"]);   // failed sub-run excluded
     expect(st.predicate.ledger).toHaveLength(7);
-    expect(st.predicate.producer).toMatchObject({ tool: "tonyai", model: "qwen" });
+    expect(st.predicate.producer).toMatchObject({ tool: "uig-studios-ai", model: "qwen" });
   });
   it("recalled claim has no evidence", async () => {
     const st = await buildTurnStatement({ turnId: "t2", model: "m", mode: "chat", finalText: "I think so", steps: [] });

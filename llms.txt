@@ -1,4 +1,4 @@
-# TonyAI
+# UIG Studios AI
 
 > Local-first desktop AI agent (Tauri + React + Rust + Ollama). Private repo.
 

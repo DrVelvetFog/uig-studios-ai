@@ -12,7 +12,7 @@
 // for modern GQA models, scaling linearly with context. Usable memory =
 // RAM − OS/app headroom. Crude, but it reproduces every measurement above.
 
-const OS_HEADROOM_BYTES = 3e9;          // macOS + TonyAI + WebKit working set
+const OS_HEADROOM_BYTES = 3e9;          // macOS + UIG Studios AI + WebKit working set
 const KV_RATIO_AT_16K   = 1 / 3;        // KV cache ≈ weights/3 at 16K ctx
 const CTX_STEPS         = [32768, 16384, 8192];
 

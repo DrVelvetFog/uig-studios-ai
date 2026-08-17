@@ -1,5 +1,5 @@
 /**
- * TonyAI Ops — config-driven portfolio checks (Phase 1 of the ops console).
+ * UIG Studios AI Ops — config-driven portfolio checks (Phase 1 of the ops console).
  *
  * Config:  ~/.tonyai/ops.json        (seeded from scripts/ops-default.json on first run;
  *                                     edit freely — read every run; delete to re-seed)
@@ -14,7 +14,7 @@
  *   http             — GET url, up on 2xx. metric = latency ms.
  *   sui-balance      — SUI balance over GraphQL; down when below minBalanceSui. metric = SUI.
  *   sui-object-field — read a u64 field off a shared object; info finding when it
- *                      INCREASES (growth signal, e.g. PoR total_minted). metric = value.
+ *                      INCREASES (growth signal, e.g. an on-chain counter). metric = value.
  *   http-field       — read a numeric dot-path field from a JSON HTTP response (e.g.
  *                      mints.count off /api/health). gauge; metric = value.
  *   Any counter check (http-field / sui-object-field) with `maxPerInterval` ALSO gets
@@ -112,7 +112,7 @@ async function suiBalanceCheck(c) {
 }
 
 // Read a numeric field (dot-path) out of a JSON HTTP response — e.g. mint volume or
-// L2 accrual off the PoR attestor's /api/health. Pair with `maxPerInterval` for
+// a rate derived from a counter (originally an attestor's /api/health). Pair with `maxPerInterval` for
 // anomaly (rate-spike) alerting in the runner. Gauge: status stays "up" on success.
 function getPath(obj, path) {
   return String(path).split(".").reduce((o, k) => (o == null ? undefined : o[k]), obj);
@@ -312,6 +312,8 @@ export async function runOpsChecks({ addFinding, notify, run }) {
     };
   }));
 
+  if (Array.isArray(config?.projectOrder)) state.projectOrder = config.projectOrder;   // Ops panel card-group order
+  state.updatedAt = Date.now();
   writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
 
   // Full-picture snapshot line (statuses + numeric metrics) for trends/sparklines
@@ -343,8 +345,8 @@ function capHistory() {
 // unavailable, so the brief always lands.
 
 const BRIEF_PATH = join(TONYAI_DIR, "ops-brief.json");
-const BRIEF_SYSTEM = `You are summarizing the daily status of Tony's project portfolio
-(PoR proof-of-personhood, FairLine vault, Hole in Town game, Sui trading bots, this Mac).
+const BRIEF_SYSTEM = `You are summarizing the daily status of the services this machine monitors
+(everything defined in ~/.tonyai/ops.json, grouped by project, plus this Mac itself).
 Write like you are texting a friend who runs all of this.
 
 Include exactly:

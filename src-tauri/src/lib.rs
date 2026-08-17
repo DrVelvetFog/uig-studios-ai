@@ -459,7 +459,7 @@ fn launch_self_update(source_dir: String) -> Result<String, String> {
 
     Ok(format!(
         "Update started in the background — tests, build, install (~3-5 min). \
-         Progress: {} . Quit and relaunch TonyAI when it finishes.",
+         Progress: {} . Quit and relaunch UIG Studios AI when it finishes.",
         log.display()
     ))
 }
@@ -757,7 +757,7 @@ fn cloud_request(provider: &str, url: &str, body: String, timeout_s: u64) -> Res
     if provider == "openrouter" {
         req = req
             .header("HTTP-Referer", "https://github.com/DrVelvetFog/tonyai")
-            .header("X-Title", "TonyAI");
+            .header("X-Title", "UIG Studios AI");
     }
     Ok(req.body(body))
 }
@@ -2877,7 +2877,7 @@ async fn mcp_initialize(
     let init_params = serde_json::json!({
         "protocolVersion": "2025-03-26",
         "capabilities": { "tools": {} },
-        "clientInfo": { "name": "TonyAI", "version": "1.1.0" }
+        "clientInfo": { "name": "UIG Studios AI", "version": "1.1.0" }
     });
 
     // ── HTTP transport ────────────────────────────────────────────────────────
@@ -3155,7 +3155,7 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             // Kill every background process group on normal app exit so dev
-            // servers and watch tasks don't outlive TonyAI. (Force-quit/crash
+            // servers and watch tasks don't outlive UIG Studios AI. (Force-quit/crash
             // is covered by the persistent registry + orphan reconciliation.)
             if let tauri::RunEvent::Exit = event {
                 if let Some(pm) = app_handle.try_state::<ProcessManager>() {

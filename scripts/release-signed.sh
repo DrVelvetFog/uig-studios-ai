@@ -1,5 +1,5 @@
 #!/bin/zsh
-# release-signed.sh — build a code-signed (and, with credentials, notarized) TonyAI.app.
+# release-signed.sh — build a code-signed (and, with credentials, notarized) UIG Studios AI.app.
 #
 #   ./scripts/release-signed.sh                 # auto-detect identity, notarize if creds present
 #   ./scripts/release-signed.sh --dev-ok        # allow an "Apple Development" identity (NOT distributable)
@@ -60,7 +60,7 @@ npm test >/dev/null
 echo "[$(date '+%H:%M:%S')] Building signed bundle…"
 npm run tauri build -- --bundles app,dmg
 
-APP=src-tauri/target/release/bundle/macos/TonyAI.app
+APP="src-tauri/target/release/bundle/macos/UIG Studios AI.app"
 echo "[$(date '+%H:%M:%S')] Verifying signature…"
 codesign --verify --deep --strict --verbose=2 "$APP"
 codesign -dv --verbose=1 "$APP" 2>&1 | grep -E "^(Authority|TeamIdentifier|Timestamp|Runtime)" || true
@@ -72,6 +72,6 @@ fi
 ls -1 src-tauri/target/release/bundle/dmg/*.dmg 2>/dev/null || true
 
 if [[ $INSTALL -eq 1 ]]; then
-  rm -rf /Applications/TonyAI.app && cp -R "$APP" /Applications/
-  echo "✅ Installed to /Applications/TonyAI.app — quit and relaunch."
+  rm -rf "/Applications/UIG Studios AI.app" && cp -R "$APP" /Applications/
+  echo "✅ Installed to /Applications/UIG Studios AI.app — quit and relaunch."
 fi

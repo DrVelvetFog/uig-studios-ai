@@ -100,7 +100,7 @@ export function DevInspectPanel({ accent, onClose }) {
   const helperSnippet = `// Add this after txb.setGasBudget() in flash-executor.ts (dev only)
 const bytes = await txb.build({ client: suiClient });
 console.log('[devInspect-bytes]', Buffer.from(bytes).toString('base64'));
-// Then paste the logged base64 string into TonyAI's devInspect panel`;
+// Then paste the logged base64 string into UIG Studios AI's devInspect panel`;
 
   return (
     <div style={{ padding:"12px 18px 14px", borderBottom:"1px solid var(--tny-line)", background:"var(--tny-deep)", flexShrink:0 }}>

@@ -1,4 +1,4 @@
-// memoryOkf.js — TonyAI memory files as Open Knowledge Format (OKF v0.2) concepts.
+// memoryOkf.js — UIG Studios AI memory files as Open Knowledge Format (OKF v0.2) concepts.
 //
 // Memory lives in ~/TonyAI-Projects/memory/<name>.md, one wiki-page per scope
 // (global + per-mode). This module makes each page an OKF concept document:
@@ -89,7 +89,7 @@ export function stampMemory(text, { name, by, at = new Date().toISOString(), tit
   lines.push(`type: ${has("type") ? yaml.type : MEMORY_TYPE}`);
   lines.push(`title: ${has("title") ? yaml.title : (title || defaultTitle(name, body))}`);
   if (has("description")) lines.push(`description: ${yaml.description}`);
-  lines.push(`generated: { by: ${by || "tonyai/agent"}, at: ${at} }`);
+  lines.push(`generated: { by: ${by || "uig-studios-ai/agent"}, at: ${at} }`);
   lines.push(`status: ${has("status") ? yaml.status : "stable"}`);
   for (const [k, v] of Object.entries(yaml)) {
     if (["type", "title", "description", "generated", "status"].includes(k)) continue;
@@ -173,7 +173,7 @@ export function validateBundle(files) {
   return { ok: ok && bundleErrors.length === 0, bundleErrors, results };
 }
 
-/** Is this path a TonyAI memory file? (write sites use this to decide whether to stamp) */
+/** Is this path a UIG Studios AI memory file? (write sites use this to decide whether to stamp) */
 export function isMemoryPath(p) {
   return /(^|\/)TonyAI-Projects\/memory\/[^/]+\.md$/.test(String(p || "").replace(/\\/g, "/"));
 }

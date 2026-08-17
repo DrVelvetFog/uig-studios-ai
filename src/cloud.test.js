@@ -21,7 +21,7 @@ describe("toOpenAIMessages", () => {
       { role: "user", content: "list /tmp" },
       // Ollama native tool call: object args, NO id
       { role: "assistant", content: "", tool_calls: [{ function: { name: "list_dir", arguments: { path: "/tmp" } } }] },
-      // TonyAI's result with a generated id that doesn't match anything
+      // UIG Studios AI's result with a generated id that doesn't match anything
       { role: "tool", content: "a\nb", tool_call_id: "call_1749999999", name: "list_dir" },
     ]);
 

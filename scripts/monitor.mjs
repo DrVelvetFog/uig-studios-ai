@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * TonyAI Background Monitor
+ * UIG Studios AI Background Monitor
  * Runs every 5 minutes via launchd.
  * Writes findings to ~/.tonyai/inbox.json
  * Sends macOS notifications for critical findings.
@@ -113,10 +113,7 @@ async function llmAnalyze(systemPrompt, userContent, model = "hermes3") {
   }
 }
 
-// (JOB 1 — Arb bot health — REMOVED 2026-07-30. The sui-arb-bot is retired and was
-// never in pm2, so every 5-minute run shelled out to `pm2 describe`/`pm2 logs` for a
-// process that does not exist. That is what filled ~/.tonyai/monitor-error.log with
-// [PM2][WARN] lines, and each run also spent an Ollama call analyzing empty logs.)
+// (JOB 1 was a project-specific health job; removed 2026-07-30.)
 
 // ══════════════════════════════════════════════════════════════════════════════
 // JOB 2 — Ollama model staleness
@@ -173,7 +170,7 @@ async function checkDiskSpace() {
       source:   "disk-warning",
       severity: "warning",
       title:    `Disk at ${pct}% — getting full`,
-      body:     "Consider clearing old logs, model files, or TonyAI exports.",
+      body:     "Consider clearing old logs, model files, or UIG Studios AI exports.",
       context:  output,
     }, 24 * 60);
   }

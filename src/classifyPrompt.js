@@ -1,5 +1,5 @@
 /**
- * Auto-router: classify a user prompt into a TonyAI mode.
+ * Auto-router: classify a user prompt into a UIG Studios AI mode.
  * Pure function — no side effects, no imports.
  * Returned values: "image" | "sui" | "python" | "code" | "chat"
  */

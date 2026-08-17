@@ -1,4 +1,4 @@
-# TonyAI
+# UIG Studios AI
 
 A local-first desktop AI agent. Tauri 2 + React + Rust, driving Ollama models on your own machine (cloud models optional). One person's daily workstation, built to be trustworthy rather than magical.
 
@@ -6,7 +6,7 @@ A local-first desktop AI agent. Tauri 2 + React + Rust, driving Ollama models on
 
 ## What makes it different
 
-Most agent apps ask you to trust the transcript. TonyAI records things a stranger could check:
+Most agent apps ask you to trust the transcript. UIG Studios AI records things a stranger could check:
 
 - **Undo for shell commands.** File edits are checkpointed per turn (↩ Revert), and — the part most tools skip — `run_command` effects are journaled too: when a command runs inside a git repo it goes through [rv](https://github.com/DrVelvetFog/reversible), which snapshots the worktree before/after as a content-addressed tree. The message gets an **↩ Undo command effects** button; restore is per-path and refuses files you edited since.
 - **Evidence tiers, stamped by code.** Every tool step is tagged by *what kind of tool it is* — `ran` (executed), `read` (file/URL/RAG), `told` (web search, MCP, another agent) — never by the model. A completed turn shows the strongest tier its steps actually support; the settings table shows **ran-backed %** per model (of completed runs, how many rested on an executed step). Transcript exports carry a `.evidence.json` sidecar of [in-toto Statements](https://github.com/DrVelvetFog/evidence-tier).

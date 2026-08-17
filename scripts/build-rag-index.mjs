@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * TonyAI RAG indexer — builds a semantic search index over a source tree.
+ * UIG Studios AI RAG indexer — builds a semantic search index over a source tree.
  * Point SOURCE_DIRS at whatever codebase sui/auto mode should be able to search.
  * Run: node scripts/build-rag-index.mjs
  * Output: ~/.tonyai/rag-index.json
@@ -13,7 +13,7 @@ import os from "os";
 const OLLAMA_URL    = "http://localhost:11434";
 const EMBED_MODEL   = "nomic-embed-text";
 const SOURCE_DIRS   = [
-  "/Users/tonyjagodka/tonyai/src",
+  `${process.env.HOME}/TonyAI-Documents`,
 ];
 const SOURCE_EXTS   = new Set([".ts", ".js", ".rs", ".py", ".move"]);
 const CHUNK_SIZE    = 1200;   // chars per chunk
@@ -59,7 +59,7 @@ async function embed(texts) {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
-  console.log("🔷 TonyAI RAG Indexer");
+  console.log("🔷 UIG Studios AI RAG Indexer");
   console.log(`   Model:  ${EMBED_MODEL}`);
   console.log(`   Output: ${OUTPUT_PATH}`);
   console.log();
@@ -132,7 +132,7 @@ async function main() {
   const sizeMB = (fs.statSync(OUTPUT_PATH).size / 1024 / 1024).toFixed(2);
   console.log(`✅ Index built: ${embeddedChunks.length} chunks, ${sizeMB} MB`);
   console.log(`   Saved to: ${OUTPUT_PATH}`);
-  console.log(`\n   Restart TonyAI — RAG will auto-load in Arb Bot mode.`);
+  console.log(`\n   Restart UIG Studios AI — RAG will auto-load for the configured source directory.`);
 }
 
 main().catch(e => { console.error("❌", e.message); process.exit(1); });
