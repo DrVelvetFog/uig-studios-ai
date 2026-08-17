@@ -18,6 +18,13 @@ cd "$(dirname "$0")/.."
 DEV_OK=0; INSTALL=0
 for a in "$@"; do case "$a" in --dev-ok) DEV_OK=1;; --install) INSTALL=1;; esac; done
 
+# Notarization creds live outside the repo, same convention as the app's secrets.
+[[ -f "$HOME/.tonyai/secret-notary.env" ]] && source "$HOME/.tonyai/secret-notary.env"
+[[ -n "${APPLE_API_KEY_PATH:-}" ]] && APPLE_API_KEY_PATH="${APPLE_API_KEY_PATH/#\~/$HOME}" && export APPLE_API_KEY_PATH
+if [[ -n "${APPLE_API_KEY:-}" && ! -f "${APPLE_API_KEY_PATH:-/nonexistent}" ]]; then
+  echo "✗ APPLE_API_KEY_PATH not found: ${APPLE_API_KEY_PATH:-unset}"; exit 2
+fi
+
 identity="${APPLE_SIGNING_IDENTITY:-}"
 if [[ -z "$identity" ]]; then
   identity=$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1 || true)
