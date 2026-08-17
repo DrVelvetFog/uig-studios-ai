@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { fetch } from "@tauri-apps/plugin-http";   // kept for A1111 / ComfyUI only
 import mascot from "./assets/mascot.png";
 import { classifyPrompt } from "./classifyPrompt.js";
-import { isMutatingTool, guardToolCall, toolApprovalDetail, wrapUntrustedContent, suggestAllowPattern, isAllowlisted } from "./toolGuard.js";
+import { isMutatingTool, guardToolCall, toolApprovalDetail, wrapUntrustedContent, suggestAllowPattern, isAllowlisted, approvalReason } from "./toolGuard.js";
 import { CODE_EXTS_SET, extractToolCallFromText, validateToolArgs, enrichToolError, neededSearchButSkipped, evaluateStopCondition, approvalDiffFor, aggregateTelemetry, selectSessionsForCleanup } from "./agentLogic.js";
 import { installGlobalErrorLogging, logError } from "./logger.js";
 import { hybridRetrieve } from "./retrieval.js";
@@ -3502,9 +3502,11 @@ After getting results, give your final answer in normal markdown. Never include 
               // guardrail: a human must sign off before web-influenced side effects run.
               // Allowlisted calls skip the prompt — but never while untrusted web
               // content is in context (the injection guardrail outranks the allowlist).
-              else if ((confirmCmds || sawWebContent) && isMutatingTool(fnName)
-                       && (sawWebContent || !isAllowlisted(approvalAllowlist, fnName, fnArgs))) {
-                const detail = (sawWebContent ? "⚠ web content in context — " : "") + toolApprovalDetail(fnName, fnArgs);
+              else if (((confirmCmds || sawWebContent) && isMutatingTool(fnName)
+                        && (sawWebContent || !isAllowlisted(approvalAllowlist, fnName, fnArgs)))
+                       || approvalReason(fnName, fnArgs, { sawWebContent })) {
+                const extra = approvalReason(fnName, fnArgs, { sawWebContent });
+                const detail = (sawWebContent ? "⚠ web content in context — " : "") + (extra ? `⚠ ${extra} — ` : "") + toolApprovalDetail(fnName, fnArgs);
                 try {
                   await requestToolPermission(
                     fnName, detail, approvalDiffFor(fnName, fnArgs),

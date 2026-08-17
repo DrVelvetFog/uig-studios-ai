@@ -47,6 +47,32 @@ const SENSITIVE_BASENAMES = new Set([
   "authorized_keys", "known_hosts", "id_rsa", "id_ed25519", "crontab", "sudoers",
 ]);
 
+// Credential stores: never READ by any tool (read_file, search_files, list_dir, git_*, python_exec,
+// or a shell command that names them). Writes are covered by protectedPathReason. This closes the
+// exfil chain "read secret silently → send it out via fetch_url/web_search".
+const CREDENTIAL_PATH_RE = new RegExp([
+  String.raw`(^|/)\.ssh(/|$)`, String.raw`(^|/)\.aws(/|$)`, String.raw`(^|/)\.gnupg(/|$)`, String.raw`(^|/)\.gpg(/|$)`,
+  String.raw`(^|/)\.kube(/|$)`, String.raw`(^|/)\.docker/config\.json$`, String.raw`(^|/)\.private_keys(/|$)`,
+  String.raw`(^|/)\.tauri/[^/]*\.key$`, String.raw`(^|/)\.tonyai/secret-[^/]*$`, String.raw`(^|/)\.tonyai/[^/]*\.env$`,
+  String.raw`(^|/)Library/Keychains(/|$)`, String.raw`(^|/)\.netrc$`, String.raw`(^|/)\.npmrc$`, String.raw`(^|/)\.pypirc$`,
+  String.raw`(^|/)\.config/gh/hosts\.yml$`, String.raw`(^|/)\.git-credentials$`, String.raw`(^|/)AuthKey_[^/]*\.p8$`,
+  String.raw`(^|/)id_(rsa|ed25519|ecdsa|dsa)(\.pub)?$`,
+].join("|"), "i");
+export function credentialPathReason(path) {
+  const s = normPath(path);
+  if (!s) return null;
+  return CREDENTIAL_PATH_RE.test(s) ? "credential store — never read by tools" : null;
+}
+// A shell command that names a credential path (cat ~/.ssh/id_ed25519, curl -d @$HOME/.tonyai/secret-x.txt …).
+const CREDENTIAL_IN_CMD_RE = /(~|\$HOME|\$\{HOME\}|\/Users\/[^/\s]+|\/home\/[^/\s]+)?\/?(\.ssh\/|\.aws\/|\.gnupg\/|\.private_keys\/|\.tauri\/[^\s]*\.key|\.tonyai\/secret-|\.tonyai\/[^\s]*\.env|Library\/Keychains\/|\.netrc\b|\.git-credentials\b|\.config\/gh\/hosts\.yml|AuthKey_[^\s]*\.p8|id_(rsa|ed25519|ecdsa)\b)/i;
+
+// Things that look like secrets in OUTBOUND arguments (URLs, search queries, MCP args).
+const SECRET_TOKEN_RE = /(sk-[A-Za-z0-9_-]{16,}|sk-ant-[A-Za-z0-9_-]{10,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|gho_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}|(?:api[_-]?key|token|secret|password)=[A-Za-z0-9_\-]{16,})/;
+export function outboundSecretReason(text) {
+  const t = String(text || "");
+  return SECRET_TOKEN_RE.test(t) ? "looks like a secret/token is being sent out" : null;
+}
+
 function basename(p) {
   const cleaned = String(p || "").replace(/\/+$/, "");
   const i = cleaned.lastIndexOf("/");
@@ -124,8 +150,19 @@ export function dangerousReason(text) {
     return "recursive chown on a system/root path";
   }
 
-  // Piping a remote script straight into a shell.
+  // Piping a remote script (or a decoded/obfuscated payload) straight into a shell.
   if (/\b(curl|wget)\b[^\n|]*\|\s*(sudo\s+)?(sh|bash|zsh)\b/i.test(cmd)) return "executing a remote script piped into a shell";
+  if (/\b(base64|openssl\s+enc|xxd|gunzip|zcat)\b[^\n|]*\|\s*(sudo\s+)?(sh|bash|zsh|python3?|perl|node)\b/i.test(cmd)) return "executing a decoded payload piped into an interpreter";
+  // Recursive delete via find on root/home, rm on parent traversal.
+  if (/\bfind\s+(\/|~|\$HOME|\.\.)\S*[^\n|;&]*\s-(delete|exec\s+rm)\b/i.test(cmd)) return "find -delete on a root/home/parent path";
+  if (/\brm\b[^\n|;&]*\s-[a-z]*[rf][a-z]*[^\n|;&]*\s(\.\.\/)+(\.\.)?\s*(\s|$|;|&)/i.test(cmd) || /\brm\b[^\n|;&]*\s-[a-z]*[rf][a-z]*\s+\.\.(\s|$)/i.test(cmd)) return "recursive delete of a parent directory";
+  // Kill everything / wipe scheduler / keychain destruction / dumping keychain secrets.
+  if (/\bkill\s+(-\d+\s+|-[A-Z]+\s+)?-1\b/i.test(cmd)) return "kill -1 (all processes)";
+  if (/\bcrontab\s+-r\b/i.test(cmd)) return "crontab -r (wipes the scheduler)";
+  if (/\bsecurity\s+(delete-keychain|find-(generic|internet)-password\b[^\n]*\s-[gw]\b|dump-keychain)/i.test(cmd)) return "keychain deletion or secret dump";
+  if (/\bosascript\b[^\n]*administrator\s+privileges/i.test(cmd)) return "AppleScript privilege escalation";
+  // Any command that names a credential store.
+  if (CREDENTIAL_IN_CMD_RE.test(cmd)) return "command references a credential store (ssh/aws/keychain/app secrets)";
 
   // Python destructive calls on root/home.
   if (/shutil\.rmtree\s*\(\s*['"]?(\/|~)/.test(cmd)) return "shutil.rmtree on a root/home path";
@@ -145,10 +182,44 @@ export function guardToolCall(name, args = {}) {
     const r = dangerousReason(args.code);
     if (r) return { blocked: true, reason: r };
   } else if (name === "write_file" || name === "edit_file") {
-    const r = protectedPathReason(args.path);
+    const r = protectedPathReason(args.path) || credentialPathReason(args.path);
+    if (r) return { blocked: true, reason: r };
+  } else if (name === "read_file" || name === "list_dir" || name === "search_files" || /^git_/.test(name)) {
+    const r = credentialPathReason(args.path || args.dir || args.repo_path);
+    if (r) return { blocked: true, reason: r };
+  } else if (name === "fetch_url" || name === "web_search" || name === "deep_search") {
+    const r = outboundSecretReason(args.url || args.query);
+    if (r) return { blocked: true, reason: r };
+  } else if (name.startsWith("mcp__")) {
+    const r = outboundSecretReason(JSON.stringify(args || {}));
     if (r) return { blocked: true, reason: r };
   }
   return { blocked: false };
+}
+
+// Reads/outbound calls that are not blocked but must ASK (even though the tool is read-only):
+//  - reading a .env-style file (secrets by convention, but legit in dev work)
+//  - after untrusted web content is in context: an outbound URL/query carrying a long or
+//    blob-like payload (the exfil half of the "lethal trifecta" that token patterns can't catch)
+const ENV_FILE_RE = /(^|\/)\.env(\.[A-Za-z0-9_-]+)?$/;
+export function approvalReason(name, args = {}, { sawWebContent = false } = {}) {
+  if (name === "read_file" || name === "search_files") {
+    const p = normPath(args.path || args.dir || "");
+    if (ENV_FILE_RE.test(p)) return "reads a .env file (secrets by convention)";
+  }
+  if (sawWebContent && (name === "fetch_url" || name === "web_search" || name === "deep_search")) {
+    const t = String(args.url || args.query || "");
+    if (t.length > 160) return "outbound request with a long payload while untrusted web content is in context";
+    if (/[A-Za-z0-9+/=_-]{40,}/.test(t.replace(/^https?:\/\/[^/?#]+/, ""))) return "outbound request with a blob-like payload while untrusted web content is in context";
+  }
+  return null;
+}
+
+// Never satisfiable by an "Always allow" pattern — these prompt every time even when allowlisted.
+const NEVER_ALLOWLIST_RE = /\bgit\s+(push\b[^\n]*(--force|-f\b|--force-with-lease)|reset\s+--hard|clean\s+-[a-z]*f|branch\s+-D|checkout\s+--\s+\.)|\bgh\s+(repo|release)\s+delete\b|\bnpm\s+(publish|unpublish)\b|\baws\s+s3\s+(rm|rb)\b|\bdocker\s+(system\s+prune|volume\s+rm|rmi)\b|\bkubectl\s+delete\b|\b(curl|wget)\b[^\n]*(\s-T\s|\s-(d|F)\s*[^\s]*@|--data(-binary|-raw)?\s*@|--upload-file|--form\s+[^\s]*@)|\bterraform\s+destroy\b|\bnetlify\s+deploy\b[^\n]*--prod|\bpm2\s+(delete|kill)\b/i;
+export function neverAllowlistReason(name, args = {}) {
+  if (name !== "run_command" && name !== "run_background") return null;
+  return NEVER_ALLOWLIST_RE.test(String(args.command || "")) ? "destructive/outbound command — always asks, even if allowlisted" : null;
 }
 
 // ── Prompt-injection defense for fetched web content ──────────────────────────
@@ -240,6 +311,7 @@ export function isAllowlisted(allowlist, name, args = {}) {
   if (name === "run_command" || name === "run_background") {
     const cmd = String(args.command || "").trim();
     if (!cmd || SHELL_META_RE.test(cmd)) return false; // compound commands always prompt
+    if (neverAllowlistReason(name, args)) return false; // force-push, publish, prune, file uploads… always prompt
     return entries.some(e => cmd === e.pattern || cmd.startsWith(e.pattern + " "));
   }
   if (name === "write_file" || name === "edit_file") {
