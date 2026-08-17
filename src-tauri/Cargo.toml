@@ -28,6 +28,8 @@ futures-util = "0.3"
 tokio = { version = "1", features = ["process", "time", "sync", "io-util"] }
 base64 = "0.22"
 regex  = "1"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

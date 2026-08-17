@@ -17,6 +17,7 @@ import { InboxPanel } from "./components/InboxPanel.jsx";
 import { OpsPanel } from "./components/OpsPanel.jsx";
 import { ComparePanel } from "./components/ComparePanel.jsx";
 import { FirstRun } from "./components/FirstRun.jsx";
+import { checkForUpdate, installUpdate } from "./updater.js";
 import { stampMemory, stripFrontmatter, isMemoryPath, memoryNameFromPath, RESERVED_NAMES } from "./memoryOkf.js";
 import { rvScope, rvWrapCommand, parseRvReport, stripRvReport, rvUndoCommand } from "./rv.js";
 import { evidenceSummary, evidenceLine, completionTier, buildTurnStatement } from "./evidence.js";
@@ -1802,6 +1803,8 @@ export default function App() {
   // Cloud provider keys — same 0600 secret store, never localStorage
   const [openrouterKey, setOpenrouterKey] = useState("");
   const [openaiKey, setOpenaiKey]         = useState("");
+  const [customUrl, setCustomUrl]         = useState("");   // any OpenAI-compatible base URL (…/v1): HF router, LM Studio, vLLM, llama.cpp
+  const [customKey, setCustomKey]         = useState("");   // optional bearer for that endpoint
   const [cloudModels, setCloudModels]     = useState([]); // prefixed ids: "or/…", "oai/…"
   const [sessionCost, setSessionCost]     = useState(0);  // USD spent on cloud this app session
   const secretsLoadedRef = useRef(false);
@@ -1821,6 +1824,22 @@ export default function App() {
   const [confirmCmds, setConfirmCmds] = useState(() => localStorage.getItem("tonyai-confirm-cmds") !== "false");
   const [pendingCmd,  setPendingCmd]   = useState(null); // null | { name, detail, diff, allowSuggestion } — awaiting user approval
   const pendingCmdRef = useRef(null);
+  // Release updates (tauri-plugin-updater; signed; endpoint on GitHub Releases)
+  const [releaseUpdate, setReleaseUpdate] = useState(null);   // { current, available, version, notes, update, error }
+  const [releaseProgress, setReleaseProgress] = useState(null); // 0..1 while installing
+  const [releaseDismissed, setReleaseDismissed] = useState(false);
+  async function checkRelease(manual = false) {
+    const r = await checkForUpdate();
+    setReleaseUpdate(r);
+    if (manual) setCompactNotice(r.available ? `⬆ Update ${r.version} available` : r.error ? `Update check failed: ${r.error}` : `Up to date (${r.current || "dev"})`);
+    return r;
+  }
+  async function installRelease() {
+    if (!releaseUpdate?.update) return;
+    setReleaseProgress(0);
+    try { await installUpdate(releaseUpdate.update, setReleaseProgress); }
+    catch (e) { setReleaseProgress(null); setCompactNotice(`Update failed: ${String(e)}`); }
+  }
   // Self-update status line (shown after clicking "Rebuild & update")
   const [updateStatus, setUpdateStatus] = useState("");
   async function startSelfUpdate() {
@@ -1915,6 +1934,10 @@ export default function App() {
         if (orK) setOpenrouterKey(orK);
         const oaK = await invoke("read_secret", { key: "openai" });
         if (oaK) setOpenaiKey(oaK);
+        const cxU = await invoke("read_secret", { key: "custom-url" });
+        if (cxU) setCustomUrl(cxU);
+        const cxK = await invoke("read_secret", { key: "custom" });
+        if (cxK) setCustomKey(cxK);
       } catch (e) { logError("secret load failed", String(e)); }
       secretsLoadedRef.current = true;
     })();
@@ -1934,6 +1957,14 @@ export default function App() {
     if (!secretsLoadedRef.current) return;
     invoke("save_secret", { key: "openai", value: openaiKey }).catch(e => logError("secret save failed", String(e)));
   }, [openaiKey]);
+  useEffect(() => {
+    if (!secretsLoadedRef.current) return;
+    invoke("save_secret", { key: "custom-url", value: customUrl.trim() }).catch(e => logError("secret save failed", String(e)));
+  }, [customUrl]);
+  useEffect(() => {
+    if (!secretsLoadedRef.current) return;
+    invoke("save_secret", { key: "custom", value: customKey }).catch(e => logError("secret save failed", String(e)));
+  }, [customKey]);
 
   // Curated cloud model list — refreshed when keys change (debounced so
   // half-typed keys don't fire requests)
@@ -1958,13 +1989,19 @@ export default function App() {
           .map(id => "oai/" + id));
       } catch (e) { logError("openai models", String(e)); }
     }
+    if (customUrl.trim()) {
+      try {
+        const ids = JSON.parse(await invoke("cloud_list_models", { provider: "custom" }));
+        next.push(...ids.filter(id => !/(embed|whisper|tts|rerank)/i.test(id)).sort().slice(0, 60).map(id => "cx/" + id));
+      } catch (e) { logError("custom endpoint models", String(e)); }
+    }
     setCloudModels(next);
   }
   useEffect(() => {
     if (!secretsLoadedRef.current) return;
     const t = setTimeout(refreshCloudModels, 800);
     return () => clearTimeout(t);
-  }, [openrouterKey, openaiKey]);
+  }, [openrouterKey, openaiKey, customUrl, customKey]);
   useEffect(() => { localStorage.setItem("tonyai-smart-route", smartRoute); }, [smartRoute]);
   useEffect(() => { localStorage.setItem("tonyai-confirm-cmds", confirmCmds); }, [confirmCmds]);
   useEffect(() => { localStorage.setItem("tonyai-rag-dir", ragSourceDir); }, [ragSourceDir]);
@@ -2554,6 +2591,9 @@ export default function App() {
     for (const srv of enabledServers) {
       initMcpServer(srv); // fire-and-forget; errors update server status
     }
+
+    // Quiet release-update check shortly after startup (no-op in dev/web preview)
+    setTimeout(() => { checkRelease(false).catch(() => {}); }, 12000);
 
     // rv availability (reversible shell actions) — probe once
     try { RV_AVAILABLE = /RV_OK/.test(String(await invoke("tool_run_command", { command: "test -x ~/reversible/rv && echo RV_OK", timeoutSeconds: 5 }))); } catch { RV_AVAILABLE = false; }
@@ -4235,10 +4275,17 @@ After getting results, give your final answer in normal markdown. Never include 
                       return <option key={m} value={m} title={f.detail}>{FIT_DOT[f.level]} {m}</option>;
                     }) : <option>No models</option>}
                   </optgroup>
-                  {cloudModels.length > 0 && (
+                  {cloudModels.some(m => !m.startsWith("cx/")) && (
                     <optgroup label="☁ Cloud (per-token billing)">
-                      {cloudModels.map(m => (
+                      {cloudModels.filter(m => !m.startsWith("cx/")).map(m => (
                         <option key={m} value={m}>☁ {cloudDisplayName(m)}</option>
+                      ))}
+                    </optgroup>
+                  )}
+                  {cloudModels.some(m => m.startsWith("cx/")) && (
+                    <optgroup label="⇄ Custom endpoint (OpenAI-compatible)">
+                      {cloudModels.filter(m => m.startsWith("cx/")).map(m => (
+                        <option key={m} value={m}>⇄ {cloudDisplayName(m)}</option>
                       ))}
                     </optgroup>
                   )}
@@ -4248,7 +4295,7 @@ After getting results, give your final answer in normal markdown. Never include 
                   if (isCloudModel(model)) {
                     return (
                       <div style={{ fontSize:9, color:"#38bdf8", fontFamily:"'JetBrains Mono',monospace", marginBottom:5, lineHeight:1.4 }}>
-                        ☁ cloud model via {cloudProvider(model) === "openrouter" ? "OpenRouter" : "OpenAI"} — billed per token, cost shown in header
+                        ☁ cloud model via {cloudProvider(model) === "openrouter" ? "OpenRouter" : cloudProvider(model) === "custom" ? "custom endpoint" : "OpenAI"} — billed per token, cost shown in header
                       </div>
                     );
                   }
@@ -4458,6 +4505,16 @@ After getting results, give your final answer in normal markdown. Never include 
                   placeholder="sk-…  (platform.openai.com — GPT models direct, no markup)"
                   style={{ flex:1, background:"var(--tny-surface)", border:"1px solid var(--tny-line2)", borderRadius:6, padding:"5px 9px", fontSize:12, color:"var(--tny-tx1)", fontFamily:"'JetBrains Mono',monospace", outline:"none" }}/>
               </div>
+              <div style={{ display:"flex", alignItems:"center", gap:8, marginTop:6 }}>
+                <span style={{ fontSize:11, color:"var(--tny-tx4)", minWidth:92 }}>Custom endpoint</span>
+                <input type="text" value={customUrl} onChange={e=>setCustomUrl(e.target.value)}
+                  placeholder="https://router.huggingface.co/v1  ·  http://localhost:1234/v1 (LM Studio)  ·  vLLM / llama.cpp"
+                  style={{ flex:1, background:"var(--tny-surface)", border:"1px solid var(--tny-line2)", borderRadius:6, padding:"5px 9px", fontSize:12, color:"var(--tny-tx1)", fontFamily:"'JetBrains Mono',monospace" }}/>
+                <input type="password" value={customKey} onChange={e=>setCustomKey(e.target.value)}
+                  placeholder="key (optional)"
+                  style={{ width:130, background:"var(--tny-surface)", border:"1px solid var(--tny-line2)", borderRadius:6, padding:"5px 9px", fontSize:12, color:"var(--tny-tx1)", fontFamily:"'JetBrains Mono',monospace" }}/>
+              </div>
+              <div style={{ fontSize:10, color:"var(--tny-tx5)", marginTop:2 }}>Any OpenAI-compatible server. Models appear in the picker as <span style={{ fontFamily:"'JetBrains Mono',monospace" }}>cx/…</span>. Hugging Face GGUF models also work locally via <span style={{ fontFamily:"'JetBrains Mono',monospace" }}>ollama pull hf.co/&lt;user&gt;/&lt;repo&gt;</span>.</div>
               <div style={{ marginTop:5, fontSize:10, color:"var(--tny-tx5)", lineHeight:1.5 }}>
                 {cloudModels.length > 0
                   ? `☁ ${cloudModels.length} cloud models available in the sidebar model picker. Cloud is manual-select only — smart routing stays local.`
@@ -4473,8 +4530,24 @@ After getting results, give your final answer in normal markdown. Never include 
               <div style={{ marginTop:4, fontSize:10, color:"var(--tny-tx5)", lineHeight:1.5 }}>
                 read_file, list_dir, web_search, fetch_url auto-execute silently — read-only and safe
               </div>
-              {/* Self-update from source */}
+              {/* Release updates (signed, GitHub Releases) */}
               <div style={{ marginTop:10, paddingTop:8, borderTop:"1px solid var(--tny-line)", display:"flex", alignItems:"center", gap:10, flexWrap:"wrap" }}>
+                <button onClick={()=>checkRelease(true)}
+                  style={{ background:"none", border:"1px solid var(--tny-line2)", color:"var(--tny-tx3)", cursor:"pointer", borderRadius:6, padding:"4px 12px", fontSize:11, fontFamily:"inherit" }}>
+                  ⟳ Check for updates
+                </button>
+                {releaseUpdate?.available && releaseProgress == null && (
+                  <button onClick={installRelease} style={{ background:"rgba(34,197,94,0.10)", border:"1px solid rgba(34,197,94,0.35)", color:"#22c55e", cursor:"pointer", borderRadius:6, padding:"4px 12px", fontSize:11, fontFamily:"inherit", fontWeight:500 }}>
+                    ⬆ Install {releaseUpdate.version} & relaunch
+                  </button>
+                )}
+                <span style={{ fontSize:10, color:"var(--tny-tx4)", fontFamily:"'JetBrains Mono',monospace" }}>
+                  {releaseProgress != null ? `downloading… ${Math.round(releaseProgress*100)}%`
+                   : releaseUpdate ? (releaseUpdate.available ? `v${releaseUpdate.current} → v${releaseUpdate.version}` : releaseUpdate.error ? "" : `v${releaseUpdate.current || "dev"} · up to date`) : ""}
+                </span>
+              </div>
+              {/* Self-update from source */}
+              <div style={{ marginTop:6, display:"flex", alignItems:"center", gap:10, flexWrap:"wrap" }}>
                 <button onClick={startSelfUpdate}
                   style={{ background:"none", border:"1px solid var(--tny-line2)", color:"var(--tny-tx3)", cursor:"pointer", borderRadius:6, padding:"4px 12px", fontSize:11, fontFamily:"inherit" }}>
                   ⬆ Rebuild & update app from source
@@ -4770,6 +4843,16 @@ After getting results, give your final answer in normal markdown. Never include 
           style={{ width: sidebarOpen ? "calc(100vw - 240px)" : "100vw" }}>
           {/* Inner column: fixed pixel max-width + margin:auto = reliable centering */}
           <div style={{ maxWidth:680, margin:"0 auto", padding:"28px 24px 16px", display:"flex", flexDirection:"column", gap:24 }}>
+          {releaseUpdate?.available && !releaseDismissed && (
+            <div style={{ display:"flex", alignItems:"center", gap:10, padding:"8px 12px", borderRadius:9, background:"rgba(34,197,94,0.07)", border:"1px solid rgba(34,197,94,0.25)", fontSize:12 }}>
+              <span>⬆ UIG Studios AI {releaseUpdate.version} is available{releaseUpdate.notes ? ` — ${releaseUpdate.notes.split("\n")[0].slice(0,120)}` : ""}.</span>
+              <span style={{ flex:1 }}/>
+              {releaseProgress == null
+                ? <button onClick={installRelease} style={{ background:"rgba(34,197,94,0.12)", border:"1px solid rgba(34,197,94,0.4)", color:"#22c55e", cursor:"pointer", borderRadius:6, padding:"3px 10px", fontSize:11, fontFamily:"inherit", fontWeight:500 }}>Install & relaunch</button>
+                : <span style={{ fontSize:11, color:"var(--tny-tx4)", fontFamily:"'JetBrains Mono',monospace" }}>downloading… {Math.round(releaseProgress*100)}%</span>}
+              <button onClick={()=>setReleaseDismissed(true)} title="Later" style={{ background:"none", border:"none", color:"var(--tny-tx5)", cursor:"pointer", fontSize:13 }}>×</button>
+            </div>
+          )}
           {messages.length===0 ? (
             <div className="empty-state">
               {/* Icon mark — "T" in purple gradient per design spec */}

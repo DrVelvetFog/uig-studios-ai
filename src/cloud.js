@@ -7,23 +7,25 @@
 //   "oai/gpt-5"                       → OpenAI direct
 
 export function isCloudModel(m) {
-  return typeof m === "string" && (m.startsWith("or/") || m.startsWith("oai/"));
+  return typeof m === "string" && (m.startsWith("or/") || m.startsWith("oai/") || m.startsWith("cx/"));
 }
 
 export function cloudProvider(m) {
   if (typeof m !== "string") return null;
   if (m.startsWith("or/"))  return "openrouter";
   if (m.startsWith("oai/")) return "openai";
+  if (m.startsWith("cx/"))  return "custom";     // any OpenAI-compatible endpoint: HF router, LM Studio, vLLM, llama.cpp…
   return null;
 }
 
 export function cloudModelId(m) {
-  return String(m || "").replace(/^or\//, "").replace(/^oai\//, "");
+  return String(m || "").replace(/^or\//, "").replace(/^oai\//, "").replace(/^cx\//, "");
 }
 
 export function cloudDisplayName(m) {
   if (m.startsWith("or/"))  return m.slice(3);
   if (m.startsWith("oai/")) return m.slice(4);
+  if (m.startsWith("cx/"))  return m.slice(3);
   return m;
 }
 

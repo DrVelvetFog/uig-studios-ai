@@ -4,6 +4,7 @@
 #   ./scripts/release-signed.sh                 # auto-detect identity, notarize if creds present
 #   ./scripts/release-signed.sh --dev-ok        # allow an "Apple Development" identity (NOT distributable)
 #   ./scripts/release-signed.sh --install       # also copy the result to /Applications
+#   ./scripts/release-signed.sh --release       # also publish a GitHub Release (dmg, updater tar.gz+sig, latest.json)
 #
 # Identity: $APPLE_SIGNING_IDENTITY, else the first "Developer ID Application" in the keychain.
 #           A "Developer ID Application" cert is what Gatekeeper on OTHER Macs requires.
@@ -15,11 +16,19 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-DEV_OK=0; INSTALL=0
-for a in "$@"; do case "$a" in --dev-ok) DEV_OK=1;; --install) INSTALL=1;; esac; done
+DEV_OK=0; INSTALL=0; RELEASE=0
+for a in "$@"; do case "$a" in --dev-ok) DEV_OK=1;; --install) INSTALL=1;; --release) RELEASE=1;; esac; done
 
-# Notarization creds live outside the repo, same convention as the app's secrets.
+# Notarization + updater-signing creds live outside the repo, same convention as the app's secrets.
 [[ -f "$HOME/.tonyai/secret-notary.env" ]] && source "$HOME/.tonyai/secret-notary.env"
+[[ -f "$HOME/.tonyai/secret-updater.env" ]] && source "$HOME/.tonyai/secret-updater.env"
+if [[ -n "${TAURI_SIGNING_PRIVATE_KEY_PATH:-}" && -f "$TAURI_SIGNING_PRIVATE_KEY_PATH" ]]; then
+  export TAURI_SIGNING_PRIVATE_KEY="$(cat "$TAURI_SIGNING_PRIVATE_KEY_PATH")"   # updater artifacts get signed
+  export TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+  echo "Updater signing: key at $TAURI_SIGNING_PRIVATE_KEY_PATH"
+else
+  echo "Updater signing: NO KEY (updater .tar.gz/.sig will not be produced) — see ~/.tonyai/secret-updater.env"
+fi
 [[ -n "${APPLE_API_KEY_PATH:-}" ]] && APPLE_API_KEY_PATH="${APPLE_API_KEY_PATH/#\~/$HOME}" && export APPLE_API_KEY_PATH
 if [[ -n "${APPLE_API_KEY:-}" && ! -f "${APPLE_API_KEY_PATH:-/nonexistent}" ]]; then
   echo "✗ APPLE_API_KEY_PATH not found: ${APPLE_API_KEY_PATH:-unset}"; exit 2
@@ -70,6 +79,47 @@ else
   echo "⚠️  Gatekeeper: not accepted — expected without notarization or with a Development identity."
 fi
 ls -1 src-tauri/target/release/bundle/dmg/*.dmg 2>/dev/null || true
+
+# ── Release artifacts: rename (no spaces — GitHub mangles them), write latest.json for the updater ──
+VER=$(python3 -c "import json;print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+REPO_SLUG="DrVelvetFog/tonyai"
+OUT="src-tauri/target/release/bundle/release-v$VER"; rm -rf "$OUT"; mkdir -p "$OUT"
+DMG=$(ls src-tauri/target/release/bundle/dmg/*.dmg | head -1)
+cp "$DMG" "$OUT/UIG-Studios-AI_${VER}_aarch64.dmg"
+TGZ=$(ls "src-tauri/target/release/bundle/macos/"*.app.tar.gz 2>/dev/null | head -1 || true)
+if [[ -n "$TGZ" && -f "$TGZ.sig" ]]; then
+  cp "$TGZ" "$OUT/UIG-Studios-AI_${VER}_aarch64.app.tar.gz"
+  cp "$TGZ.sig" "$OUT/UIG-Studios-AI_${VER}_aarch64.app.tar.gz.sig"
+  python3 - "$OUT" "$VER" "$REPO_SLUG" <<'PY'
+import json, sys, datetime
+out, ver, slug = sys.argv[1:]
+sig = open(f"{out}/UIG-Studios-AI_{ver}_aarch64.app.tar.gz.sig").read().strip()
+notes = ""
+try:
+    notes = open("RELEASE_NOTES.md").read().strip()
+except FileNotFoundError:
+    pass
+json.dump({
+  "version": ver,
+  "notes": notes,
+  "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+  "platforms": { "darwin-aarch64": {
+      "signature": sig,
+      "url": f"https://github.com/{slug}/releases/download/v{ver}/UIG-Studios-AI_{ver}_aarch64.app.tar.gz" } }
+}, open(f"{out}/latest.json", "w"), indent=2)
+print(f"latest.json → v{ver} darwin-aarch64")
+PY
+else
+  echo "⚠️  No updater artifacts (.app.tar.gz + .sig) — updater signing key missing?"
+fi
+ls -1 "$OUT"
+
+if [[ $RELEASE -eq 1 ]]; then
+  echo "[$(date '+%H:%M:%S')] Publishing GitHub Release v$VER…"
+  NOTES_ARG=(--generate-notes); [[ -f RELEASE_NOTES.md ]] && NOTES_ARG=(--notes-file RELEASE_NOTES.md)
+  gh release create "v$VER" --repo "$REPO_SLUG" --title "UIG Studios AI $VER" "${NOTES_ARG[@]}" "$OUT"/* \
+    && echo "✅ Released: https://github.com/$REPO_SLUG/releases/tag/v$VER (updater endpoint: releases/latest/download/latest.json)"
+fi
 
 if [[ $INSTALL -eq 1 ]]; then
   rm -rf "/Applications/UIG Studios AI.app" && cp -R "$APP" /Applications/

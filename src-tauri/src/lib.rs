@@ -727,10 +727,22 @@ fn ollama_abort(cancel: State<'_, StreamCancelMap>, event_id: Option<String>) {
 // The frontend keeps speaking Ollama's ndjson chunk shape; these commands
 // translate OpenAI-style SSE into it, so the agent loop is provider-agnostic.
 
-fn cloud_endpoint(provider: &str) -> Result<(&'static str, &'static str), String> {
+/// Base URL of the user's custom OpenAI-compatible endpoint (stored via save_secret("custom-url")),
+/// e.g. http://localhost:1234/v1 (LM Studio), http://localhost:8000/v1 (vLLM / llama.cpp),
+/// https://router.huggingface.co/v1 (Hugging Face Inference Providers).
+fn custom_endpoint_base() -> Result<String, String> {
+    let path = tonyai_dir()?.join("secret-custom-url.txt");
+    let v = std::fs::read_to_string(&path).unwrap_or_default().trim().trim_end_matches('/').to_string();
+    if v.is_empty() { return Err("No custom endpoint configured — set the base URL in ⚙ settings".into()); }
+    if !(v.starts_with("http://") || v.starts_with("https://")) { return Err("custom endpoint must start with http:// or https://".into()); }
+    Ok(v)
+}
+
+fn cloud_endpoint(provider: &str) -> Result<(String, &'static str), String> {
     match provider {
-        "openrouter" => Ok(("https://openrouter.ai/api/v1/chat/completions", "openrouter")),
-        "openai"     => Ok(("https://api.openai.com/v1/chat/completions", "openai")),
+        "openrouter" => Ok(("https://openrouter.ai/api/v1/chat/completions".to_string(), "openrouter")),
+        "openai"     => Ok(("https://api.openai.com/v1/chat/completions".to_string(), "openai")),
+        "custom"     => Ok((format!("{}/chat/completions", custom_endpoint_base()?), "custom")),
         _ => Err(format!("unknown cloud provider: {provider}")),
     }
 }
@@ -747,13 +759,14 @@ fn read_secret_value(key: &str) -> Result<String, String> {
 }
 
 fn cloud_request(provider: &str, url: &str, body: String, timeout_s: u64) -> Result<reqwest::RequestBuilder, String> {
-    let key = read_secret_value(provider)?;
+    // Local OpenAI-compatible servers (LM Studio, llama.cpp, vLLM) usually need no key.
+    let key = match read_secret_value(provider) { Ok(k) => k, Err(e) if provider == "custom" => { let _ = e; String::new() } Err(e) => return Err(e) };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_s))
         .build().map_err(|e| e.to_string())?;
     let mut req = client.post(url)
-        .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", key));
+        .header("Content-Type", "application/json");
+    if !key.is_empty() { req = req.header("Authorization", format!("Bearer {}", key)); }
     if provider == "openrouter" {
         req = req
             .header("HTTP-Referer", "https://github.com/DrVelvetFog/tonyai")
@@ -914,7 +927,7 @@ async fn cloud_chat(
     let _cleanup = CancelCleanup(&cancel, event_id.clone());
 
     let (url, _) = cloud_endpoint(&provider)?;
-    let response = cloud_request(&provider, url, body, 600)?
+    let response = cloud_request(&provider, &url, body, 600)?
         .send().await
         .map_err(|e| format!("{provider} connection failed: {e}"))?;
 
@@ -970,7 +983,7 @@ async fn cloud_chat(
 #[tauri::command]
 async fn cloud_post(provider: String, body: String) -> Result<String, String> {
     let (url, _) = cloud_endpoint(&provider)?;
-    let resp = cloud_request(&provider, url, body, 300)?
+    let resp = cloud_request(&provider, &url, body, 300)?
         .send().await
         .map_err(|e| format!("{provider} connection failed: {e}"))?;
     if !resp.status().is_success() {
@@ -1011,17 +1024,18 @@ async fn cloud_post(provider: String, body: String) -> Result<String, String> {
 #[tauri::command]
 async fn cloud_list_models(provider: String) -> Result<String, String> {
     let url = match provider.as_str() {
-        "openrouter" => "https://openrouter.ai/api/v1/models",
-        "openai"     => "https://api.openai.com/v1/models",
+        "openrouter" => "https://openrouter.ai/api/v1/models".to_string(),
+        "openai"     => "https://api.openai.com/v1/models".to_string(),
+        "custom"     => format!("{}/models", custom_endpoint_base()?),
         _ => return Err(format!("unknown cloud provider: {provider}")),
     };
-    let key = read_secret_value(&provider)?;
+    let key = match read_secret_value(&provider) { Ok(k) => k, Err(_) if provider == "custom" => String::new(), Err(e) => return Err(e) };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build().map_err(|e| e.to_string())?;
-    let resp = client.get(url)
-        .header("Authorization", format!("Bearer {}", key))
-        .send().await
+    let mut get = client.get(&url);
+    if !key.is_empty() { get = get.header("Authorization", format!("Bearer {}", key)); }
+    let resp = get.send().await
         .map_err(|e| format!("{provider} models fetch failed: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("{provider} models HTTP {}", resp.status()));
@@ -3083,6 +3097,8 @@ pub fn run() {
         .manage(ProcessManager::new())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             read_rag_index,
             save_rag_index,

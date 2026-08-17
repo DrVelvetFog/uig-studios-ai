@@ -2,17 +2,27 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for the main window",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "opener:default",
     {
       "identifier": "http:default",
       "allow": [
-        { "url": "http://127.0.0.1:11434/**" },
-        { "url": "http://127.0.0.1:7860/**" },
-        { "url": "http://127.0.0.1:8188/**" }
+        {
+          "url": "http://127.0.0.1:11434/**"
+        },
+        {
+          "url": "http://127.0.0.1:7860/**"
+        },
+        {
+          "url": "http://127.0.0.1:8188/**"
+        }
       ]
-    }
+    },
+    "updater:default",
+    "process:default"
   ]
 }

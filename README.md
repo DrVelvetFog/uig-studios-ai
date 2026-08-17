@@ -20,7 +20,7 @@ Most agent apps ask you to trust the transcript. UIG Studios AI records things a
 - **Modes:** Auto (classifier-routed), Chat, Code, Python, Agent, Sui/Move, Ops, Image, ComfyUI. Each mode has its own tool set, model tier, and memory scope.
 - **Agent loop:** hand-rolled ReAct loop over native Ollama tool calling (with a prompt-JSON fallback for models without tool support). Tools: `web_search` / `deep_search` / `fetch_url`, `read_file` / `write_file` / `edit_file` / `list_dir` / `search_files`, `run_command` / `run_background` / `process_*`, `python_exec` (sandboxed venv), read-only `git_*`, `search_knowledge` (RAG), `search_sessions`, `propose_plan`, `spawn_subagent` (researcher / coder / verifier / fixer; coder auto-chains coder → verifier → fixer).
 - **MCP client** in Rust — stdio and streamable-HTTP transports, tools namespaced `mcp__<server>__<tool>`, always behind approval.
-- **Models:** local Ollama with model-fit indicators for your RAM (context clamped for big models); OpenRouter and OpenAI as an explicit cloud tier with per-session cost; blind A/B compare with vote-then-reveal.
+- **Models:** local Ollama with model-fit indicators for your RAM (context clamped for big models) — including any GGUF on Hugging Face via `ollama pull hf.co/<user>/<repo>`; OpenRouter and OpenAI as an explicit cloud tier with per-session cost; **any OpenAI-compatible endpoint** (Hugging Face Inference Providers, LM Studio, vLLM, llama.cpp server) as a custom provider; blind A/B compare with vote-then-reveal.
 - **Memory & context:** two RAG indexes (code + knowledge base, hybrid vector + keyword), two-level context compaction, per-project `TONYAI.md` instructions auto-injected when tools touch a project tree.
 - **Sessions:** on disk, forkable, auto-exported to markdown; background processes survive the turn and die with the app.
 - **Ops console:** a launchd monitor runs config-driven health checks (HTTP, Sui balances/objects, pm2) every five minutes, posts transitions to an in-app inbox and macOS notifications, and writes a daily brief.
@@ -42,7 +42,7 @@ npm test                    # vitest
 ./scripts/update-app.sh     # test → tauri build → install to /Applications
 ```
 
-For a signed (and, with credentials, notarized) build see `scripts/release-signed.sh`. Unsigned builds run only on the machine that built them.
+For a signed (and, with credentials, notarized) build see `scripts/release-signed.sh`; it also produces the updater artifacts and `latest.json` and, with `--release`, publishes a GitHub Release. Installed builds check GitHub Releases for signed updates (Settings → Check for updates). Unsigned builds run only on the machine that built them.
 
 ## Configuration
 

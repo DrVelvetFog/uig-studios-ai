@@ -83,3 +83,14 @@ describe("toOpenAIBody", () => {
     expect(toOpenAIBody({ model: "m", messages: msgs, tools, temperature: 0.3 }, "openrouter").tools).toBe(tools);
   });
 });
+
+describe("custom OpenAI-compatible provider (cx/)", () => {
+  it("routes cx/ ids to the custom provider and strips the prefix", async () => {
+    const { isCloudModel, cloudProvider, cloudModelId, cloudDisplayName } = await import("./cloud.js");
+    expect(isCloudModel("cx/meta-llama/Llama-3.1-8B-Instruct")).toBe(true);
+    expect(cloudProvider("cx/foo")).toBe("custom");
+    expect(cloudModelId("cx/foo/bar")).toBe("foo/bar");
+    expect(cloudDisplayName("cx/foo")).toBe("foo");
+    expect(cloudProvider("qwen2.5-coder:7b")).toBeNull();
+  });
+});
