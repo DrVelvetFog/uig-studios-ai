@@ -283,3 +283,18 @@ describe("enrichToolError", () => {
     expect(enrichToolError("mystery_tool", "boom")).toContain("Adjust the arguments");
   });
 });
+
+describe("aggregateTelemetry — evidence ranRate", () => {
+  it("computes % of completed runs backed by ran; null without tier data", async () => {
+    const { aggregateTelemetry } = await import("./agentLogic.js");
+    const lines = [
+      { model: "m", outcome: "complete", completionTier: "ran" },
+      { model: "m", outcome: "complete", completionTier: "told" },
+      { model: "m", outcome: "answered", completionTier: "read" },
+      { model: "old", outcome: "complete" },
+    ].map(o => JSON.stringify(o)).join("\n");
+    const rows = aggregateTelemetry(lines);
+    expect(rows.find(r => r.model === "m").ranRate).toBe(50);
+    expect(rows.find(r => r.model === "old").ranRate).toBeNull();
+  });
+});

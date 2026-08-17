@@ -18,6 +18,7 @@ import { OpsPanel } from "./components/OpsPanel.jsx";
 import { ComparePanel } from "./components/ComparePanel.jsx";
 import { stampMemory, stripFrontmatter, isMemoryPath, memoryNameFromPath, RESERVED_NAMES } from "./memoryOkf.js";
 import { rvScope, rvWrapCommand, parseRvReport, stripRvReport, rvUndoCommand } from "./rv.js";
+import { evidenceSummary, evidenceLine, completionTier, buildTurnStatement } from "./evidence.js";
 
 // rv (reversible shell actions) — set at bootstrap if ~/reversible/rv is executable.
 // When present, run_command inside a git repo is journaled and undoable (see rv.js).
@@ -1308,7 +1309,7 @@ async function runSubagent({ role, task, model, signal, braveApiKey, onProgress,
               const scope = RV_AVAILABLE && checkpoint ? rvScope(fnArgs.command, checkpoint.lastToolDir) : null;
               const raw = await invoke("tool_run_command", { command: scope ? rvWrapCommand(fnArgs.command, scope, { actor: `tonyai/${model || "agent"}` }) : fnArgs.command, timeoutSeconds: null });
               const rep = scope ? parseRvReport(raw) : null;
-              if (rep) { checkpoint.rvActions.push({ ...rep, command: fnArgs.command }); if (scope) checkpoint.lastToolDir = scope; toolResult = stripRvReport(raw); }
+              if (rep) { checkpoint.rvActions.push({ ...rep, command: fnArgs.command }); if (scope) checkpoint.lastToolDir = scope; toolResult = stripRvReport(raw); step.rv = rep; }
               else toolResult = raw;
             }
             else if (fnName === "write_file")   toolResult = await invoke("tool_write_file",   { path: fnArgs.path, content: isMemoryPath(fnArgs.path) ? stampMemory(fnArgs.content, { name: memoryNameFromPath(fnArgs.path), by: `tonyai/${model || "agent"}` }) : fnArgs.content });
@@ -2204,7 +2205,8 @@ export default function App() {
           }
         }
         if (msg.content) lines.push(`\n${msg.content}`);
-        if (msg.taskComplete) lines.push(`\n✅ **Task complete**`);
+        if (msg.taskComplete) lines.push(`\n✅ **Task complete**${msg.evidenceTier ? ` — evidence: ${msg.evidenceTier}` : ""}`);
+        if (msg.evidence) lines.push(`_Evidence: ${msg.evidence}_`);
         if (msg.stopRejected) lines.push(`\n⛔ *Stop rejected: ${msg.stopReason}*`);
         lines.push("");
         continue;
@@ -2239,6 +2241,11 @@ export default function App() {
       const path     = `${homeDir}/TonyAI-Exports/${filename}`;
       const content  = formatSessionMarkdown(session);
       await invoke("tool_write_file", { path, content });
+      // Evidence sidecar (in-toto Statements, evidence-tier predicate) — one per agent turn
+      const statements = msgs.map(m => m.evidenceStatement).filter(Boolean);
+      if (statements.length) {
+        try { await invoke("tool_write_file", { path: path.replace(/\.md$/, ".evidence.json"), content: JSON.stringify({ schema: "evidence-tier/v0", statements }, null, 1) }); } catch {}
+      }
       savedSessionMap.current[key] = msgs.length;
     } catch (e) {
       console.warn("[TonyAI] Auto-save failed:", e);
@@ -3165,6 +3172,7 @@ MEMORY: If you learn a user preference, project constraint, correction, or recur
 
         // Tracks every completed tool step this session — used by the stop condition evaluator
         const loopToolSteps = [];
+        let finalAnswerText = "";   // last assistant text this turn — subject of the evidence statement
 
         // Checkpoint for this turn — every file write_file/edit_file touches
         // (including inside subagents) is snapshotted under this id so the
@@ -3361,6 +3369,7 @@ After getting results, give your final answer in normal markdown. Never include 
                   const correction = `[STOP CONDITION NOT MET] ${stopCheck.reason}`;
                   ollamaMsgs.push({ role:"assistant", content: streamText });
                   ollamaMsgs.push({ role:"user",      content: correction });
+                  finalAnswerText = streamText;
                   // Show the correction notice in the UI
                   setMessages(prev => {
                     const u = [...prev];
@@ -3377,6 +3386,7 @@ After getting results, give your final answer in normal markdown. Never include 
                   // Evaluator passed — accept completion
                   telemetry.outcome = "complete";
                   const clean = streamText.replace(/\n?TASK_COMPLETE\s*$/m, "").trimEnd();
+                  finalAnswerText = clean;
                   setMessages(prev => {
                     const u = [...prev];
                     u[u.length-1] = { ...u[u.length-1], content: clean, taskComplete: true };
@@ -3425,6 +3435,7 @@ After getting results, give your final answer in normal markdown. Never include 
               const tcId = tc.id || `call_${Date.now()}`;
 
               let toolResult;
+              let stepRv = null;   // rv journal report when run_command was journaled
               let toolBlocked = false;
               let capturedSubResult = null; // captured from spawn_subagent branch for loopToolSteps
               const stepId = `step_${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -3547,7 +3558,7 @@ After getting results, give your final answer in normal markdown. Never include 
                     const scope = RV_AVAILABLE ? rvScope(fnArgs.command, turnCheckpoint.lastToolDir) : null;
                     const raw = await invoke("tool_run_command", { command: scope ? rvWrapCommand(fnArgs.command, scope, { actor: `tonyai/${model || "agent"}` }) : fnArgs.command, timeoutSeconds: fnArgs.timeout_seconds ?? null });
                     const rep = scope ? parseRvReport(raw) : null;
-                    if (rep) { turnCheckpoint.rvActions.push({ ...rep, command: fnArgs.command }); if (scope) turnCheckpoint.lastToolDir = scope; toolResult = stripRvReport(raw); }
+                    if (rep) { turnCheckpoint.rvActions.push({ ...rep, command: fnArgs.command }); if (scope) turnCheckpoint.lastToolDir = scope; toolResult = stripRvReport(raw); stepRv = rep; }
                     else toolResult = raw;
                   }
                   else if (fnName === "run_background") { toolResult = await invoke("tool_run_background", { command: fnArgs.command }); refreshBgProcs(); }
@@ -3746,6 +3757,7 @@ After getting results, give your final answer in normal markdown. Never include 
                 args:     fnArgs,
                 status:   isToolErr ? "error" : "done",
                 result:   String(toolResult),
+                ...(stepRv ? { rv: stepRv } : {}),
                 // Preserve subSteps when the tool is spawn_subagent
                 ...(fnName === "spawn_subagent" && typeof toolResult === "string" ? {} : {}),
               });
@@ -3862,10 +3874,13 @@ After getting results, give your final answer in normal markdown. Never include 
           // One telemetry line per agent run — powers the per-model stats table
           if (ctrl.signal.aborted && telemetry.outcome === "answered") telemetry.outcome = "aborted";
           const { startedAt, ...rest } = telemetry;
+          const evSummary = evidenceSummary(loopToolSteps);
+          const evTier    = completionTier(loopToolSteps);
           invoke("append_telemetry", {
             line: JSON.stringify({
               ts: new Date().toISOString(), ...rest,
               durationS: Math.round((Date.now() - startedAt) / 1000),
+              evidence: evSummary, completionTier: evTier,
               ...(cloudUsage.seen ? {
                 promptTokens: cloudUsage.prompt,
                 completionTokens: cloudUsage.completion,
@@ -3885,6 +3900,23 @@ After getting results, give your final answer in normal markdown. Never include 
               }
               return u;
             });
+          }
+          // Evidence tiers for this turn — stamped by code from the tool steps, never by the model.
+          if (loopToolSteps.length > 0 || finalAnswerText) {
+            const evLine = evidenceLine(loopToolSteps);
+            const evTurnId = checkpointId;
+            setMessages(prev => {
+              const u = [...prev]; const last = u[u.length-1];
+              if (last?.type === "tool_step" || last?.role === "assistant") u[u.length-1] = { ...last, evidence: evLine, evidenceTier: evTier, evidenceTurn: evTurnId };
+              return u;
+            });
+            buildTurnStatement({ turnId: evTurnId, model: activeModel, mode: effectiveMode, finalText: finalAnswerText, steps: loopToolSteps })
+              .then(st => setMessages(prev => {
+                const u = [...prev];
+                const idx = u.findIndex(m => m?.evidenceTurn === evTurnId);
+                if (idx >= 0) u[idx] = { ...u[idx], evidenceStatement: st };
+                return u;
+              })).catch(() => {});
           }
           setLoadingFor(sessId, false);
           delete streamRef.current[sessId];
@@ -4460,6 +4492,7 @@ After getting results, give your final answer in normal markdown. Never include 
                         <th style={{ padding:"2px 14px 2px 0", fontWeight:500 }}>errors</th>
                         <th style={{ padding:"2px 14px 2px 0", fontWeight:500 }}>avg loops</th>
                         <th style={{ padding:"2px 14px 2px 0", fontWeight:500 }}>stop-rejects</th>
+                        <th style={{ padding:"2px 14px 2px 0", fontWeight:500 }} title="Of completed runs, % whose completion claim rests on an executed step (evidence tier ran)">ran-backed</th>
                         <th style={{ padding:"2px 0", fontWeight:500 }}>avg time</th>
                       </tr>
                     </thead>
@@ -4472,6 +4505,7 @@ After getting results, give your final answer in normal markdown. Never include 
                           <td style={{ padding:"2px 14px 2px 0" }}>{s.errorRate}%</td>
                           <td style={{ padding:"2px 14px 2px 0" }}>{s.avgLoops}</td>
                           <td style={{ padding:"2px 14px 2px 0" }}>{s.avgStopRejections}</td>
+                          <td style={{ padding:"2px 14px 2px 0", color: s.ranRate == null ? "var(--tny-tx5)" : s.ranRate >= 70 ? "#22c55e" : s.ranRate >= 40 ? "#eab308" : "#ef4444" }}>{s.ranRate == null ? "—" : `${s.ranRate}%`}</td>
                           <td style={{ padding:"2px 0" }}>{s.avgDurationS}s</td>
                         </tr>
                       ))}
@@ -4825,7 +4859,11 @@ After getting results, give your final answer in normal markdown. Never include 
                           {msg.taskComplete && (
                             <div style={{ marginTop:12, paddingTop:10, borderTop:"1px solid rgba(34,197,94,0.18)", display:"flex", alignItems:"center", gap:6, fontSize:11, color:"#22c55e", fontFamily:"'JetBrains Mono',monospace" }}>
                               <span>✅</span><span style={{ fontWeight:500 }}>Task complete</span>
+                              {msg.evidenceTier && <span style={{ marginLeft:8, color: msg.evidenceTier==="ran" ? "#22c55e" : msg.evidenceTier==="read" ? "#60a5fa" : "#fb923c" }} title="Strongest tier the tool steps support for this completion claim (ran > read > told > recalled) — stamped by code, not by the model">evidence: {msg.evidenceTier}</span>}
                             </div>
+                          )}
+                          {msg.evidence && !msg.taskComplete && (
+                            <div style={{ marginTop:8, fontSize:10, color:"var(--tny-tx5)", fontFamily:"'JetBrains Mono',monospace" }} title="Evidence tiers of this turn's tool steps — stamped by code, not by the model">evidence: {msg.evidence}</div>
                           )}
                           {msg.stopRejected && msg.stopReason && (
                             <div style={{ marginTop:8, padding:"6px 10px", borderRadius:7, background:"rgba(251,146,60,0.07)", border:"1px solid rgba(251,146,60,0.22)", display:"flex", alignItems:"flex-start", gap:7, fontSize:11, color:"#fb923c", fontFamily:"'JetBrains Mono',monospace" }}>

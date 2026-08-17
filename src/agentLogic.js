@@ -183,9 +183,13 @@ export function aggregateTelemetry(jsonl) {
     const m = byModel.get(run.model) || {
       model: run.model, runs: 0, completed: 0, errors: 0,
       totalLoops: 0, totalStopRejections: 0, totalDurationS: 0,
+      completedRan: 0, completedWithTier: 0,   // evidence: of completed runs, how many rested on `ran`
     };
     m.runs++;
-    if (run.outcome === "complete") m.completed++;
+    if (run.outcome === "complete") {
+      m.completed++;
+      if (run.completionTier) { m.completedWithTier++; if (run.completionTier === "ran") m.completedRan++; }
+    }
     if (run.outcome === "error")    m.errors++;
     m.totalLoops += Number(run.loops) || 0;
     m.totalStopRejections += Number(run.stopRejections) || 0;
@@ -201,6 +205,9 @@ export function aggregateTelemetry(jsonl) {
       avgLoops: m.runs ? Math.round((m.totalLoops / m.runs) * 10) / 10 : 0,
       avgStopRejections: m.runs ? Math.round((m.totalStopRejections / m.runs) * 10) / 10 : 0,
       avgDurationS: m.runs ? Math.round(m.totalDurationS / m.runs) : 0,
+      // % of completed runs whose completion claim is backed by an executed step (evidence tier `ran`);
+      // null when no run has tier data yet (pre-evidence telemetry lines).
+      ranRate: m.completedWithTier ? Math.round((m.completedRan / m.completedWithTier) * 100) : null,
     }))
     .sort((a, b) => b.runs - a.runs);
 }
