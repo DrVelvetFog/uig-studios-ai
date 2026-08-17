@@ -15,7 +15,7 @@
    "predicate": {
     "id": "okf-check-fixture",
     "package": "tonyai",
-    "version": "1.3.1",
+    "version": "1.4.0",
     "command": "node scripts/okf-check.mjs examples/memory-fixture",
     "exit": 0,
     "stdout": {
@@ -23,7 +23,7 @@
      "bytes": 112,
      "tail": "OKF bundle: examples/memory-fixture\n  ok   global.md  status=stable  facts=4 tagged=3  (ran=1 read=1 told=1)\nOK\n"
     },
-    "ran_at": "2026-08-17T14:57:01Z",
+    "ran_at": "2026-08-17T15:50:31Z",
     "runner": {
      "os": "darwin",
      "python": "3.14.6",
@@ -37,7 +37,7 @@
     {
      "name": "package.json",
      "digest": {
-      "sha256": "80b3619d3c523dfba10dd4c210fddb83f3bcad33254f8f8b00cc39e9d297b697"
+      "sha256": "7739888280b3574aba0810923850adb3e5156f7379aa9ced3a8b381849f4c1b4"
      }
     }
    ],
@@ -45,7 +45,7 @@
    "predicate": {
     "id": "unit-tests",
     "package": "tonyai",
-    "version": "1.3.1",
+    "version": "1.4.0",
     "command": "npx vitest run >/dev/null 2>&1 && echo 'vitest: all tests passed'",
     "exit": 0,
     "stdout": {
@@ -53,7 +53,7 @@
      "bytes": 25,
      "tail": "vitest: all tests passed\n"
     },
-    "ran_at": "2026-08-17T14:57:02Z",
+    "ran_at": "2026-08-17T15:50:32Z",
     "runner": {
      "os": "darwin",
      "python": "3.14.6",
