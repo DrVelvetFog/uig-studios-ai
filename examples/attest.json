@@ -23,10 +23,10 @@
      "bytes": 112,
      "tail": "OKF bundle: examples/memory-fixture\n  ok   global.md  status=stable  facts=4 tagged=3  (ran=1 read=1 told=1)\nOK\n"
     },
-    "ran_at": "2026-08-17T16:06:46Z",
+    "ran_at": "2026-11-03T14:10:01Z",
     "runner": {
      "os": "darwin",
-     "python": "3.14.6",
+     "python": "3.14.7",
      "ci": false
     }
    }
@@ -37,7 +37,7 @@
     {
      "name": "package.json",
      "digest": {
-      "sha256": "320fd40f3d50955d88dd6c289e4a2bc455e05387e3a4befedf2c8f4301ad9bc1"
+      "sha256": "14cc4a858b3f73cec5fb9a63fb0c418754a3ce8033e189fc78c8984e461d1734"
      }
     }
    ],
@@ -53,10 +53,10 @@
      "bytes": 25,
      "tail": "vitest: all tests passed\n"
     },
-    "ran_at": "2026-08-17T16:06:47Z",
+    "ran_at": "2026-11-03T14:10:02Z",
     "runner": {
      "os": "darwin",
-     "python": "3.14.6",
+     "python": "3.14.7",
      "ci": false
     }
    }
